@@ -112,7 +112,7 @@ class WebSocketServer:
             print(f"\n[{ts()}] [{speaker}] {text}  ⏱ {elapsed(t)}")
 
             # Store in full meeting log for long-term memory
-            self.agent._store_to_log(speaker, text)
+            self.agent.log_exchange(speaker, text)
 
             if self._buffer_task and not self._buffer_task.done():
                 self._buffer_task.cancel()
@@ -191,7 +191,7 @@ class WebSocketServer:
     def _log_sam(self, text: str):
         """Store Sam's response in both convo history and meeting log."""
         self._convo_history.append(f"Sam: {text}")
-        self.agent._store_to_log("Sam", text)
+        self.agent.log_exchange("Sam", text)
 
     async def _tts(self, text: str) -> bytes:
         async with self._tts_semaphore:
@@ -392,6 +392,9 @@ class WebSocketServer:
             self._speaking = False
 
     async def start(self):
+        # Start RAG background embedder
+        self.agent.start()
+
         runner = web.AppRunner(self.app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self.port)
