@@ -14,7 +14,7 @@ Memory system:
 import os
 import asyncio
 import re
-from openai import AsyncOpenAI
+from openai import AsyncAzureOpenAI
 from typing import List
 
 
@@ -107,8 +107,12 @@ PM_KEYWORDS = [
 
 class PMAgent:
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        self.model = "gpt-4o-mini"
+        self.client = AsyncAzureOpenAI(
+            api_key=os.environ["AZURE_API_KEY"],
+            azure_endpoint=os.environ["AZURE_ENDPOINT"],
+            api_version=os.environ.get("AZURE_API_VERSION", "2024-02-15-preview"),
+        )
+        self.model = os.environ.get("AZURE_DEPLOYMENT", "gpt-4o-mini")
 
         # Conversation history — last 6 turns for immediate context
         self.history: list[dict] = []
