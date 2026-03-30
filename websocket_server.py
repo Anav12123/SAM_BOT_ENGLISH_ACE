@@ -212,7 +212,7 @@ class WebSocketServer:
 
         try:
             context = "\n".join(self._convo_history)
-            memory  = [m[0] for m in self.agent.memory[-20:]]
+            memory  = [e["text"] for e in self.agent.rag._entries[-20:]]
             t1 = time.time()
 
             # Fire trigger + LLM in parallel
