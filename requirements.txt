@@ -1,0 +1,7 @@
+aiohttp
+httpx
+python-dotenv
+openai
+groq
+pydub
+unidecode
