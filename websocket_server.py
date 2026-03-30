@@ -111,16 +111,22 @@ class WebSocketServer:
             text = _fix_transcription(text)
             print(f"\n[{ts()}] [{speaker}] {text}  ⏱ {elapsed(t)}")
 
-            # Store in full meeting log for long-term memory
+            # Store in RAG immediately (embedding happens async)
             self.agent.log_exchange(speaker, text)
 
-            if self._buffer_task and not self._buffer_task.done():
-                self._buffer_task.cancel()
+            # Different speaker interrupts Sam — handle immediately
+            if self._speaking and self._current_speaker != speaker:
+                print(f"[{ts()}] ⚡ INTERRUPT — {speaker} cut in")
+                asyncio.create_task(self.speaker.stop_audio())
+                self._interrupt_event.set()
+                # Flush any buffer from the new speaker
+                self._buffer.clear()
+                self._buffer.append((speaker, text, t))
+                self._restart_debounce(speaker)
+                return
 
-            # Same speaker adds more while being processed
+            # Same speaker adds more while Sam is speaking — cancel and rebuffer
             if self._speaking and self._current_speaker == speaker:
-                combined = f"{self._current_text} {text}".strip()
-                print(f"[{ts()}] 🔄 Combined: \"{combined}\" — restarting")
                 if self._current_task and not self._current_task.done():
                     self._current_task.cancel()
                 if self._audio_playing:
@@ -128,30 +134,20 @@ class WebSocketServer:
                 self._speaking = False
                 self._audio_playing = False
                 self._interrupt_event.set()
-                await asyncio.sleep(0)
-                self._start_process(combined, speaker, t)
 
-            # Different speaker interrupts
-            elif self._speaking and self._current_speaker != speaker:
-                print(f"[{ts()}] ⚡ INTERRUPT — {speaker} cut in")
-                asyncio.create_task(self.speaker.stop_audio())
-                self._interrupt_event.set()
-                self._start_process(text, speaker, t)
+            # Buffer the fragment — don't process yet
+            self._buffer.append((speaker, text, t))
+            self._restart_debounce(speaker)
 
-            # Free — start immediately
-            else:
-                self._start_process(text, speaker, t)
-
-        # Speech events
+        # ── Speech OFF — user stopped talking, flush buffer ───────────────
         elif event == "participant_events.speech_off":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
             print(f"[{ts()}] 🔇 {speaker} stopped speaking")
+            # Cancel debounce timer — process immediately on speech_off
+            if self._buffer_task and not self._buffer_task.done():
+                self._buffer_task.cancel()
             if self._buffer and not self._speaking:
-                full_text = " ".join(txt for _, txt, _ in self._buffer)
-                t0 = self._buffer[0][2]
-                self._buffer.clear()
-                self._start_process(full_text, speaker, t0)
-            self._buffer.clear()
+                self._flush_buffer()
 
         elif event == "participant_events.speech_on":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
@@ -192,6 +188,32 @@ class WebSocketServer:
         """Store Sam's response in both convo history and meeting log."""
         self._convo_history.append(f"Sam: {text}")
         self.agent.log_exchange("Sam", text)
+
+    def _restart_debounce(self, speaker: str):
+        """Reset the silence timer. Process only after 1.5s of no new fragments."""
+        if self._buffer_task and not self._buffer_task.done():
+            self._buffer_task.cancel()
+        self._buffer_task = asyncio.create_task(self._debounce_then_flush(speaker))
+
+    async def _debounce_then_flush(self, speaker: str):
+        """Safety net: if speech_off doesn't fire, flush after 1.0s silence."""
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            return
+        if self._buffer and not self._speaking:
+            self._flush_buffer()
+
+    def _flush_buffer(self):
+        """Combine all buffered fragments and start processing."""
+        if not self._buffer:
+            return
+        speaker   = self._buffer[-1][0]
+        t0        = self._buffer[0][2]
+        full_text = " ".join(txt for _, txt, _ in self._buffer)
+        self._buffer.clear()
+        print(f"[{ts()}] 📝 Buffered complete: \"{full_text}\"")
+        self._start_process(full_text, speaker, t0)
 
     async def _tts(self, text: str) -> bytes:
         async with self._tts_semaphore:
