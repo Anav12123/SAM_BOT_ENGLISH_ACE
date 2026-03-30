@@ -111,6 +111,9 @@ class WebSocketServer:
             text = _fix_transcription(text)
             print(f"\n[{ts()}] [{speaker}] {text}  ⏱ {elapsed(t)}")
 
+            # Store in full meeting log for long-term memory
+            self.agent._store_to_log(speaker, text)
+
             if self._buffer_task and not self._buffer_task.done():
                 self._buffer_task.cancel()
 
@@ -182,8 +185,13 @@ class WebSocketServer:
         if self._speaking:
             return
         greeting = f"Hey {name}, welcome to the call!"
-        self._convo_history.append(f"Sam: {greeting}")
+        self._log_sam(greeting)
         await self._speak_response(greeting, t0)
+
+    def _log_sam(self, text: str):
+        """Store Sam's response in both convo history and meeting log."""
+        self._convo_history.append(f"Sam: {text}")
+        self.agent._store_to_log("Sam", text)
 
     async def _tts(self, text: str) -> bytes:
         async with self._tts_semaphore:
@@ -268,7 +276,7 @@ class WebSocketServer:
                                     await asyncio.wait_for(self._interrupt_event.wait(), timeout=filler_dur/1000)
                                     print(f"[{ts()}] ⚡ Interrupted during filler")
                                     all_sentences.extend(sentences)
-                                    self._convo_history.append(f"Sam: {' '.join(all_sentences)} [interrupted]")
+                                    self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
                                     self.trigger.mark_responded()
                                     llm_task.cancel()
                                     return
@@ -289,7 +297,7 @@ class WebSocketServer:
 
             if not sentences and not tts_tasks:
                 if all_sentences:
-                    self._convo_history.append(f"Sam: {' '.join(all_sentences)}")
+                    self._log_sam(' '.join(all_sentences))
                     self.trigger.mark_responded()
                 return
 
@@ -335,14 +343,14 @@ class WebSocketServer:
             wait_ms = max(100, audio_dur_ms - already)
             try:
                 await asyncio.wait_for(self._interrupt_event.wait(), timeout=wait_ms/1000)
-                self._convo_history.append(f"Sam: {full_resp} [interrupted]")
+                self._log_sam(f"{full_resp} [interrupted]")
                 self.trigger.mark_responded()
                 return
             except asyncio.TimeoutError:
                 pass
 
             self._audio_playing = False
-            self._convo_history.append(f"Sam: {full_resp}")
+            self._log_sam(full_resp)
             self.trigger.mark_responded()
             print(f"[{ts()}] ✅ Done")
 
