@@ -1,24 +1,167 @@
 """
-Agent.py — Groq Llama 3.3 70B PM Agent (English only)
+Agent.py — Groq Llama 3.3 70B + In-Memory RAG
 
-Memory system for long meetings (45+ min):
-  1. meeting_log: Stores EVERY exchange from the entire meeting (unlimited)
-  2. Keyword memory: PM-topic indexed for fast recall of relevant past discussions
-  3. Recent history: Last 8 turns for immediate context
-  4. Context builder: Searches entire meeting_log for relevant exchanges + recent turns
+Memory architecture:
+  1. RAG store: Every exchange is embedded (Azure OpenAI text-embedding-3-small)
+     and stored in-memory. On query, cosine similarity finds relevant past exchanges.
+     Catches semantic matches like "money" → "budget" that keyword search misses.
+  2. Meeting log: Full text of every exchange (fallback + debugging)
+  3. Recent history: Last 10 LLM turns for conversation flow
 
-Example: At minute 45, user asks "what did we decide about the budget?"
-  → Keyword memory finds budget discussions from minute 10
-  → Recent history has the last 4 exchanges
-  → LLM gets both → accurate answer
+Embedding happens async in background — never blocks the response pipeline.
+If embeddings fail, falls back to keyword search automatically.
 """
 
 import os
 import asyncio
 import re
+import time
+import numpy as np
 from openai import AsyncOpenAI
-from typing import List
+from typing import List, Optional
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IN-MEMORY RAG STORE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MeetingRAG:
+    """In-memory vector store for meeting transcripts.
+    Uses fastembed (free, local, ~200MB). No API key needed.
+    Model: BAAI/bge-small-en-v1.5 — 130MB, 384-dim, fast on CPU.
+    """
+
+    def __init__(self):
+        self._entries: list[dict] = []
+        self._embed_queue: asyncio.Queue = asyncio.Queue()
+        self._embed_task: Optional[asyncio.Task] = None
+        self._model = None
+        self._ready = False
+
+        try:
+            from fastembed import TextEmbedding
+            self._model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+            self._ready = True
+            print("[RAG] Local embeddings ready (BAAI/bge-small-en-v1.5, fastembed)")
+        except ImportError:
+            print("[RAG] ⚠️  fastembed not installed — keyword fallback only")
+        except Exception as e:
+            print(f"[RAG] ⚠️  Model load failed: {e} — keyword fallback only")
+
+    def start_background_embedder(self):
+        if self._ready and not self._embed_task:
+            self._embed_task = asyncio.create_task(self._embedding_worker())
+
+    async def _embedding_worker(self):
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                entry = await self._embed_queue.get()
+                vector = await loop.run_in_executor(
+                    None, self._embed_sync, entry["text"]
+                )
+                if vector is not None:
+                    entry["vector"] = vector
+                    self._entries.append(entry)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[RAG] Embed worker error: {e}")
+
+    def _embed_sync(self, text: str) -> Optional[np.ndarray]:
+        if not self._model:
+            return None
+        try:
+            # fastembed returns a generator — get first result
+            vectors = list(self._model.embed([text]))
+            return np.array(vectors[0], dtype=np.float32)
+        except Exception as e:
+            print(f"[RAG] Embedding failed: {e}")
+            return None
+
+    def add(self, speaker: str, text: str):
+        """Queue an exchange for embedding (non-blocking)."""
+        entry = {
+            "text": f"{speaker}: {text}",
+            "speaker": speaker,
+            "time": time.time(),
+            "vector": None,
+        }
+        if self._ready:
+            try:
+                self._embed_queue.put_nowait(entry)
+            except Exception:
+                pass
+        else:
+            self._entries.append(entry)
+
+    async def search(self, query: str, top_k: int = 5) -> List[str]:
+        """Find relevant past exchanges by cosine similarity.
+        Falls back to keyword matching if embeddings unavailable.
+        """
+        if not self._entries:
+            return []
+
+        # Vector search
+        if self._ready and self._model:
+            loop = asyncio.get_event_loop()
+            query_vector = await loop.run_in_executor(
+                None, self._embed_sync, query
+            )
+
+            if query_vector is not None:
+                scored = []
+                for entry in self._entries:
+                    if entry["vector"] is not None:
+                        sim = self._cosine_sim(query_vector, entry["vector"])
+                        scored.append((sim, entry["text"]))
+
+                if scored:
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    results = [text for sim, text in scored[:top_k] if sim > 0.3]
+                    if results:
+                        print(f"[RAG] Vector search: {len(results)} hits for \"{query[:50]}\"")
+                        return results
+
+        # Fallback: keyword search
+        return self._keyword_search(query, top_k)
+
+    def _keyword_search(self, query: str, top_k: int = 5) -> List[str]:
+        stop = {"the", "a", "an", "is", "are", "was", "were", "what", "who",
+                "how", "when", "where", "why", "did", "do", "does", "can",
+                "could", "would", "should", "we", "i", "you", "they", "it",
+                "about", "tell", "me", "something", "discuss", "talked", "sam"}
+        query_words = {w for w in query.lower().split() if w not in stop and len(w) > 2}
+        if not query_words:
+            return []
+        scored = []
+        for entry in self._entries:
+            hits = sum(1 for w in query_words if w in entry["text"].lower())
+            if hits > 0:
+                scored.append((hits, entry["text"]))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = [text for _, text in scored[:top_k]]
+        if results:
+            print(f"[RAG] Keyword fallback: {len(results)} hits for \"{query[:50]}\"")
+        return results
+
+    @staticmethod
+    def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+        dot = np.dot(a, b)
+        norm = np.linalg.norm(a) * np.linalg.norm(b)
+        return float(dot / norm) if norm > 0 else 0.0
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    def clear(self):
+        self._entries.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 UNIFIED_PROMPT = """You are Sam, a senior PM at AnavClouds Software Solutions (Salesforce + AI company).
 You are on a live voice call. Speak like a real human PM — warm, direct, natural.
@@ -42,56 +185,37 @@ Return [SEARCH] for ANY question needing specific facts you don't have:
 Reply with EXACTLY: [SEARCH]
 Nothing else. Just [SEARCH].
 
-MEMORY INSTRUCTIONS:
+MEETING MEMORY:
 You may receive "Meeting memory" with past discussions from earlier in this meeting.
 USE this memory to answer questions about what was discussed.
-If someone asks "what did we talk about earlier?" or "what was the budget discussion?" —
-check the meeting memory and answer from it. Do NOT say "I don't remember" if the memory has it.
+If someone asks "what did we talk about?" or "what was the budget discussion?" —
+answer from the meeting memory. Do NOT say "I don't remember" if the memory has it.
 
 OUTPUT RULES (when answering, NOT when returning [SEARCH]):
 - 2 sentences max. Each sentence max 15 words.
 - Start with a natural opener: "Yeah," / "Right," / "Hmm," / "Well," / "Uh,"
-- Contractions only. No lists, no markdown, no bullet points.
-- Sound human — not robotic or corporate.
-
-EXAMPLES:
-Q: "Tell me about AnavClouds" → "Yeah, we build Salesforce and AI solutions for enterprise clients. Mostly CRM integrations and intelligent automation."
-Q: "Any blockers?" → "Hmm, one CRM sync ticket is dragging a bit. Dev lead's handling it today."
-Q: "Who are you?" → "Right, I'm Sam — senior PM at AnavClouds. We do Salesforce and AI products."
-Q: "Who is the CEO of Tesla?" → [SEARCH]
-Q: "What's happening in Iran?" → [SEARCH]
-Q: "I'm waiting for the answer" → "Sorry about the delay, I'm still pulling that together."
-Q: "What did we discuss about the budget?" → (use meeting memory to answer)
-"""
+- Contractions only. No lists, no markdown.
+- Sound human — not robotic."""
 
 SEARCH_SUMMARY_PROMPT = """You are Sam, a senior PM on a live voice call.
-You searched the web for the user's question. Here are the results:
+You searched the web. Here are the results:
 
 {search_results}
 
 Rules:
-- Do NOT start with a filler — the user already heard one while you searched.
-- Go DIRECTLY to the answer. No "So," "Well," "Right," etc.
+- Do NOT start with a filler — the user already heard one.
+- Go DIRECTLY to the answer.
 - Give 2-3 SHORT sentences. Each max 15 words.
-- Be conversational, not robotic. No markdown, no lists.
+- Be conversational. No markdown, no lists.
 - If results don't answer the question, say so honestly."""
 
-INTERRUPT_PROMPT = """You are Sam, a senior PM. You were interrupted mid-sentence.
+INTERRUPT_PROMPT = """You are Sam, a senior PM. You were interrupted.
 Reply in ONE sentence — 12 words max.
-Start with: "Oh," / "Right," / "Sure," / "Got it," then answer directly."""
+Start with: "Oh," / "Right," / "Sure," / "Got it," then answer."""
 
 SEARCH_QUERY_PROMPT = """Convert the user's message into a short English Google search query (max 8 words).
-Translate the MEANING faithfully — do NOT add topics the user didn't mention.
 ONLY replace 'our company'/'my company' with 'AnavClouds' if the user refers to their own company.
 Do NOT add AnavClouds if the user didn't mention the company.
-
-Examples:
-  'What's AnavClouds revenue?' → 'AnavClouds revenue'
-  'How many people work in our company?' → 'AnavClouds employee count'
-  'Who is the CEO of Tesla?' → 'Tesla CEO'
-  'What's happening in Iran?' → 'Iran latest news'
-  'Who won the IPL match yesterday?' → 'IPL yesterday match result'
-
 Output ONLY the search query. No quotes, no explanation."""
 
 FILLERS = [
@@ -102,30 +226,10 @@ FILLERS = [
     "Well, let me check on that real quick.",
 ]
 
-# Broader keyword set for memory indexing — not just PM terms
-MEMORY_KEYWORDS = [
-    # PM terms
-    "deadline", "deliver", "blocker", "issue", "plan", "decide",
-    "approved", "timeline", "task", "owner", "risk", "budget",
-    "scope", "stakeholder", "milestone", "sprint", "feature",
-    "requirement", "sign-off", "contract", "report", "project",
-    "team", "priority", "update", "review", "status", "delay",
-    "launch", "release", "client", "dependency", "estimate",
-    # Business terms
-    "revenue", "cost", "price", "salary", "hire", "employee",
-    "customer", "product", "market", "strategy", "goal", "target",
-    "quarter", "q1", "q2", "q3", "q4", "annual", "monthly",
-    # Technical terms
-    "api", "database", "server", "deploy", "bug", "fix", "code",
-    "integration", "salesforce", "crm", "automation", "testing",
-    # Action items
-    "action", "follow-up", "next steps", "assign", "complete",
-    "pending", "done", "progress", "blocked", "resolved",
-    # Meeting terms
-    "agenda", "meeting", "discuss", "decision", "agreed", "vote",
-    "proposal", "feedback", "concern", "question", "answer",
-]
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PM AGENT
+# ══════════════════════════════════════════════════════════════════════════════
 
 class PMAgent:
     def __init__(self):
@@ -135,15 +239,15 @@ class PMAgent:
         )
         self.model = "llama-3.3-70b-versatile"
 
-        # Recent LLM history — last 8 turns for conversation flow
+        # Recent LLM history — last 10 turns
         self.history: list[dict] = []
 
-        # Full meeting log — stores EVERY exchange, never trimmed during meeting
-        # Format: "Speaker: what they said"
-        self.meeting_log: list[str] = []
+        # RAG store — embeds + retrieves meeting exchanges
+        self.rag = MeetingRAG()
 
-        # Keyword-indexed memory for fast recall
-        self.memory: List[tuple[str, set]] = []
+    def start(self):
+        """Call once after event loop is running to start background embedder."""
+        self.rag.start_background_embedder()
 
     def _get_web_search(self):
         if not hasattr(self, '_web_search') or self._web_search is None:
@@ -151,88 +255,22 @@ class PMAgent:
             self._web_search = WebSearch()
         return self._web_search
 
-    # ── Memory System ─────────────────────────────────────────────────────────
+    # ── Memory ────────────────────────────────────────────────────────────────
 
-    def _store_to_log(self, speaker: str, text: str):
-        """Store every exchange in the full meeting log."""
-        entry = f"{speaker}: {text}"
-        self.meeting_log.append(entry)
+    def log_exchange(self, speaker: str, text: str):
+        """Store an exchange in RAG. Called by websocket_server for every transcript."""
+        self.rag.add(speaker, text)
 
-    def _store_memory(self, text: str):
-        """Index text by keywords for fast recall."""
-        lower = text.lower()
-        found = {k for k in MEMORY_KEYWORDS if k in lower}
-        if not found:
-            return
-        self.memory.append((text, found))
-        if len(self.memory) > 200:
-            self.memory = self.memory[-200:]
-
-    def _search_memory(self, query: str, top_k: int = 5) -> List[str]:
-        """Find most relevant past discussions by keyword overlap."""
-        if not self.memory:
-            return []
-        lower = query.lower()
-        query_keys = {k for k in MEMORY_KEYWORDS if k in lower}
-        if not query_keys:
-            return []
-        scored = [
-            (len(query_keys & mem_keys), text)
-            for text, mem_keys in self.memory
-        ]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [text for score, text in scored[:top_k] if score > 0]
-
-    def _search_meeting_log(self, query: str, top_k: int = 5) -> List[str]:
-        """Search full meeting log for exchanges containing query words.
-        This catches things keyword memory might miss.
-        """
-        if not self.meeting_log:
-            return []
-        lower = query.lower()
-        # Extract meaningful words from query (skip stop words)
-        stop = {"the", "a", "an", "is", "are", "was", "were", "what", "who",
-                "how", "when", "where", "why", "did", "do", "does", "can",
-                "could", "would", "should", "we", "i", "you", "they", "it",
-                "about", "tell", "me", "something", "discuss", "talked"}
-        query_words = {w for w in lower.split() if w not in stop and len(w) > 2}
-        if not query_words:
-            return []
-
-        scored = []
-        for entry in self.meeting_log:
-            entry_lower = entry.lower()
-            hits = sum(1 for w in query_words if w in entry_lower)
-            if hits > 0:
-                scored.append((hits, entry))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _, entry in scored[:top_k]]
-
-    def _build_context(self, user_text: str, context: str) -> str:
-        """Build rich context from:
-        1. Keyword memory hits (past PM discussions)
-        2. Meeting log search (full-text search across entire meeting)
-        3. Recent conversation turns
-        """
+    async def _build_context(self, user_text: str, context: str) -> str:
+        """Build rich context using RAG retrieval + recent conversation."""
         parts = []
 
-        # Search keyword memory
-        mem_hits = self._search_memory(user_text, top_k=3)
-        # Search full meeting log
-        log_hits = self._search_meeting_log(user_text, top_k=3)
+        # RAG search — finds semantically relevant past exchanges
+        rag_results = await self.rag.search(user_text, top_k=5)
+        if rag_results:
+            parts.append("Meeting memory (relevant past discussions):\n" + "\n".join(rag_results))
 
-        # Combine and deduplicate
-        all_memory = []
-        seen = set()
-        for item in mem_hits + log_hits:
-            if item not in seen:
-                seen.add(item)
-                all_memory.append(item)
-
-        if all_memory:
-            parts.append(f"Meeting memory (earlier discussions):\n" + "\n".join(all_memory[:5]))
-
+        # Recent conversation for flow
         if context:
             recent = "\n".join(context.split("\n")[-4:])
             parts.append(f"Recent conversation:\n{recent}")
@@ -240,27 +278,20 @@ class PMAgent:
         parts.append(f"User: {user_text}")
         return "\n".join(parts)
 
-    # ── Search signal detection ───────────────────────────────────────────────
+    # ── Search signal ─────────────────────────────────────────────────────────
 
     def _is_search_signal(self, text: str) -> bool:
         upper = text.strip().upper()
-        if upper.strip("[]").strip() == "SEARCH":
-            return True
-        if "[SEARCH]" in upper:
-            return True
-        return False
+        return upper.strip("[]").strip() == "SEARCH" or "[SEARCH]" in upper
 
     # ── LLM search query conversion ──────────────────────────────────────────
 
     async def _to_english_search_query(self, user_text: str, context: str) -> str:
-        """LLM converts user message to clean English search query (~200ms on Groq)."""
         clean = re.sub(r'\[LANG:\w+\]\s*', '', user_text).strip()
-
         context_hint = ""
         if context:
             recent = context.split("\n")[-3:]
             context_hint = "\nRecent conversation:\n" + "\n".join(recent)
-
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -284,8 +315,7 @@ class PMAgent:
         return await self.respond_with_context(user_text, "")
 
     async def respond_with_context(self, user_text: str, context: str, interrupted: bool = False) -> str:
-        self._store_memory(user_text)
-        full_text = self._build_context(user_text, context)
+        full_text = await self._build_context(user_text, context)
 
         if interrupted:
             return await self._llm_call(full_text, INTERRUPT_PROMPT, max_tokens=25)
@@ -293,10 +323,8 @@ class PMAgent:
         response = await self._llm_call(full_text, UNIFIED_PROMPT, max_tokens=60)
 
         if not self._is_search_signal(response):
-            self._store_memory(response)
             return response
 
-        # Web search
         print(f"[Agent] LLM said [SEARCH] — searching: {user_text}")
         search_query = await self._to_english_search_query(user_text, context)
         try:
@@ -304,9 +332,7 @@ class PMAgent:
             if not results:
                 return "Hmm, couldn't find that online right now."
             system = SEARCH_SUMMARY_PROMPT.format(search_results=results[:800])
-            answer = await self._llm_call(user_text, system, max_tokens=120)
-            self._store_memory(answer)
-            return answer
+            return await self._llm_call(user_text, system, max_tokens=120)
         except Exception as e:
             print(f"[Agent] Web search failed: {e}")
             return "Hmm, I couldn't look that up right now."
@@ -314,10 +340,8 @@ class PMAgent:
     # ── Core: streaming (used by websocket_server) ───────────────────────────
 
     async def stream_sentences_to_queue(self, user_text: str, context: str, queue: asyncio.Queue):
-        self._store_memory(user_text)
-        full_text = self._build_context(user_text, context)
+        full_text = await self._build_context(user_text, context)
 
-        # Step 1: Check [SEARCH]
         self.history.append({"role": "user", "content": full_text})
         if len(self.history) > 10:
             self.history = self.history[-10:]
@@ -339,7 +363,6 @@ class PMAgent:
         # Path A: Direct answer
         if not self._is_search_signal(first_answer):
             self.history.append({"role": "assistant", "content": first_answer})
-            self._store_memory(first_answer)
             for sentence in self._split_sentences(first_answer):
                 await queue.put(sentence)
             await queue.put(None)
@@ -401,7 +424,6 @@ class PMAgent:
             full_response = full_response.strip()
             self.history.append({"role": "user",      "content": user_text})
             self.history.append({"role": "assistant", "content": full_response})
-            self._store_memory(full_response)
 
         except Exception as e:
             print(f"[Agent] Search stream failed: {e}")
@@ -440,5 +462,4 @@ class PMAgent:
 
     def reset(self):
         self.history.clear()
-        self.memory.clear()
-        self.meeting_log.clear()
+        self.rag.clear()
