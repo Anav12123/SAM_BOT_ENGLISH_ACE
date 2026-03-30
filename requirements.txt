@@ -6,3 +6,4 @@ groq
 pydub
 unidecode
 fastembed
+numpy
