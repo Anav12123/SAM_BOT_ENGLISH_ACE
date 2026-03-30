@@ -201,7 +201,7 @@ USE it to answer questions about what was discussed — be specific, reference d
 Do NOT say "I don't remember" if the memory has it.
 
 OUTPUT RULES (when answering, NOT when returning [SEARCH]):
-- Always give exactly 3 sentences. Keep each under 18 words.
+- Give 2-3 sentences depending on complexity. Keep each under 18 words.
 - Contractions always. No lists, no markdown.
 - Sound like a real person on a call — not a chatbot reading a script.
 
@@ -340,7 +340,7 @@ class PMAgent:
         if interrupted:
             return await self._llm_call(full_text, INTERRUPT_PROMPT, max_tokens=25)
 
-        response = await self._llm_call(full_text, UNIFIED_PROMPT, max_tokens=100)
+        response = await self._llm_call(full_text, UNIFIED_PROMPT, max_tokens=80)
 
         if not self._is_search_signal(response):
             return response
@@ -371,7 +371,7 @@ class PMAgent:
                 model=self.model,
                 messages=[{"role": "system", "content": UNIFIED_PROMPT}] + self.history,
                 temperature=0.7,
-                max_tokens=100,
+                max_tokens=80,
             )
             first_answer = check.choices[0].message.content.strip()
         except Exception as e:
