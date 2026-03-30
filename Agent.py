@@ -1,20 +1,22 @@
 """
-Agent.py — GPT-4o-mini powered PM Agent (English only)
+Agent.py — Groq Llama 3.3 70B PM Agent (English only)
 
-Architecture:
-  User speaks → LLM decides: answer directly OR [SEARCH]
-  If [SEARCH] → LLM converts query to English → SerpAPI → LLM summarizes
-  
-Memory system:
-  - Conversation history (last 6 turns) for immediate context
-  - Long-term memory (keyword-indexed PM topics) for recall across conversation
-  - Conversation summary for search query context
+Memory system for long meetings (45+ min):
+  1. meeting_log: Stores EVERY exchange from the entire meeting (unlimited)
+  2. Keyword memory: PM-topic indexed for fast recall of relevant past discussions
+  3. Recent history: Last 8 turns for immediate context
+  4. Context builder: Searches entire meeting_log for relevant exchanges + recent turns
+
+Example: At minute 45, user asks "what did we decide about the budget?"
+  → Keyword memory finds budget discussions from minute 10
+  → Recent history has the last 4 exchanges
+  → LLM gets both → accurate answer
 """
 
 import os
 import asyncio
 import re
-from openai import AsyncAzureOpenAI
+from openai import AsyncOpenAI
 from typing import List
 
 
@@ -27,18 +29,24 @@ WHAT YOU KNOW (answer from this):
 - Your name is Sam, you're a senior PM at AnavClouds.
 - For greetings, small talk, questions about yourself — answer directly.
 - For vague PM questions (blockers, agenda, sprint status) — give a generic PM-style answer.
-- For impatience ("I'm waiting", "hurry up") — apologize for the delay, say you're working on it. Do NOT return [SEARCH].
+- For impatience ("I'm waiting", "hurry up") — apologize, say you're working on it. Do NOT return [SEARCH].
 
 WHEN TO SEARCH (reply with [SEARCH]):
 Return [SEARCH] for ANY question needing specific facts you don't have:
 - Revenue, headcount, funding, valuation, office locations of ANY company
 - CEO, founder, leadership, org structure
 - Current events, news, wars, elections, weather, sports scores
-- Prices, statistics, market data, stock prices
+- Prices, statistics, market data
 - Any verifiable factual information
-- When in doubt — return [SEARCH]. Do NOT make up numbers or facts.
+- When in doubt — return [SEARCH]. Do NOT make up facts or numbers.
 Reply with EXACTLY: [SEARCH]
-Nothing else. Just [SEARCH]. No explanation, no filler, no preamble.
+Nothing else. Just [SEARCH].
+
+MEMORY INSTRUCTIONS:
+You may receive "Meeting memory" with past discussions from earlier in this meeting.
+USE this memory to answer questions about what was discussed.
+If someone asks "what did we talk about earlier?" or "what was the budget discussion?" —
+check the meeting memory and answer from it. Do NOT say "I don't remember" if the memory has it.
 
 OUTPUT RULES (when answering, NOT when returning [SEARCH]):
 - 2 sentences max. Each sentence max 15 words.
@@ -52,8 +60,8 @@ Q: "Any blockers?" → "Hmm, one CRM sync ticket is dragging a bit. Dev lead's h
 Q: "Who are you?" → "Right, I'm Sam — senior PM at AnavClouds. We do Salesforce and AI products."
 Q: "Who is the CEO of Tesla?" → [SEARCH]
 Q: "What's happening in Iran?" → [SEARCH]
-Q: "How many employees does AnavClouds have?" → [SEARCH]
 Q: "I'm waiting for the answer" → "Sorry about the delay, I'm still pulling that together."
+Q: "What did we discuss about the budget?" → (use meeting memory to answer)
 """
 
 SEARCH_SUMMARY_PROMPT = """You are Sam, a senior PM on a live voice call.
@@ -83,7 +91,6 @@ Examples:
   'Who is the CEO of Tesla?' → 'Tesla CEO'
   'What's happening in Iran?' → 'Iran latest news'
   'Who won the IPL match yesterday?' → 'IPL yesterday match result'
-  'Tell me about yesterday's news' → 'yesterday news headlines'
 
 Output ONLY the search query. No quotes, no explanation."""
 
@@ -95,29 +102,47 @@ FILLERS = [
     "Well, let me check on that real quick.",
 ]
 
-PM_KEYWORDS = [
+# Broader keyword set for memory indexing — not just PM terms
+MEMORY_KEYWORDS = [
+    # PM terms
     "deadline", "deliver", "blocker", "issue", "plan", "decide",
     "approved", "timeline", "task", "owner", "risk", "budget",
     "scope", "stakeholder", "milestone", "sprint", "feature",
     "requirement", "sign-off", "contract", "report", "project",
     "team", "priority", "update", "review", "status", "delay",
     "launch", "release", "client", "dependency", "estimate",
+    # Business terms
+    "revenue", "cost", "price", "salary", "hire", "employee",
+    "customer", "product", "market", "strategy", "goal", "target",
+    "quarter", "q1", "q2", "q3", "q4", "annual", "monthly",
+    # Technical terms
+    "api", "database", "server", "deploy", "bug", "fix", "code",
+    "integration", "salesforce", "crm", "automation", "testing",
+    # Action items
+    "action", "follow-up", "next steps", "assign", "complete",
+    "pending", "done", "progress", "blocked", "resolved",
+    # Meeting terms
+    "agenda", "meeting", "discuss", "decision", "agreed", "vote",
+    "proposal", "feedback", "concern", "question", "answer",
 ]
 
 
 class PMAgent:
     def __init__(self):
-        self.client = AsyncAzureOpenAI(
-            api_key=os.environ["AZURE_API_KEY"],
-            azure_endpoint=os.environ["AZURE_ENDPOINT"],
-            api_version=os.environ.get("AZURE_API_VERSION", "2024-02-15-preview"),
+        self.client = AsyncOpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
         )
-        self.model = os.environ.get("AZURE_DEPLOYMENT", "gpt-4o-mini")
+        self.model = "llama-3.3-70b-versatile"
 
-        # Conversation history — last 6 turns for immediate context
+        # Recent LLM history — last 8 turns for conversation flow
         self.history: list[dict] = []
 
-        # Long-term memory — keyword-indexed for recall
+        # Full meeting log — stores EVERY exchange, never trimmed during meeting
+        # Format: "Speaker: what they said"
+        self.meeting_log: list[str] = []
+
+        # Keyword-indexed memory for fast recall
         self.memory: List[tuple[str, set]] = []
 
     def _get_web_search(self):
@@ -126,24 +151,29 @@ class PMAgent:
             self._web_search = WebSearch()
         return self._web_search
 
-    # ── Memory ────────────────────────────────────────────────────────────────
+    # ── Memory System ─────────────────────────────────────────────────────────
+
+    def _store_to_log(self, speaker: str, text: str):
+        """Store every exchange in the full meeting log."""
+        entry = f"{speaker}: {text}"
+        self.meeting_log.append(entry)
 
     def _store_memory(self, text: str):
-        """Store text in long-term memory if it contains PM-relevant keywords."""
+        """Index text by keywords for fast recall."""
         lower = text.lower()
-        found = {k for k in PM_KEYWORDS if k in lower}
+        found = {k for k in MEMORY_KEYWORDS if k in lower}
         if not found:
             return
         self.memory.append((text, found))
-        if len(self.memory) > 100:
-            self.memory = self.memory[-100:]
+        if len(self.memory) > 200:
+            self.memory = self.memory[-200:]
 
-    def _search_memory(self, query: str, top_k: int = 3) -> List[str]:
-        """Retrieve most relevant memories based on keyword overlap."""
+    def _search_memory(self, query: str, top_k: int = 5) -> List[str]:
+        """Find most relevant past discussions by keyword overlap."""
         if not self.memory:
             return []
         lower = query.lower()
-        query_keys = {k for k in PM_KEYWORDS if k in lower}
+        query_keys = {k for k in MEMORY_KEYWORDS if k in lower}
         if not query_keys:
             return []
         scored = [
@@ -153,22 +183,66 @@ class PMAgent:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [text for score, text in scored[:top_k] if score > 0]
 
+    def _search_meeting_log(self, query: str, top_k: int = 5) -> List[str]:
+        """Search full meeting log for exchanges containing query words.
+        This catches things keyword memory might miss.
+        """
+        if not self.meeting_log:
+            return []
+        lower = query.lower()
+        # Extract meaningful words from query (skip stop words)
+        stop = {"the", "a", "an", "is", "are", "was", "were", "what", "who",
+                "how", "when", "where", "why", "did", "do", "does", "can",
+                "could", "would", "should", "we", "i", "you", "they", "it",
+                "about", "tell", "me", "something", "discuss", "talked"}
+        query_words = {w for w in lower.split() if w not in stop and len(w) > 2}
+        if not query_words:
+            return []
+
+        scored = []
+        for entry in self.meeting_log:
+            entry_lower = entry.lower()
+            hits = sum(1 for w in query_words if w in entry_lower)
+            if hits > 0:
+                scored.append((hits, entry))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [entry for _, entry in scored[:top_k]]
+
     def _build_context(self, user_text: str, context: str) -> str:
-        """Build rich context from memory + conversation history."""
+        """Build rich context from:
+        1. Keyword memory hits (past PM discussions)
+        2. Meeting log search (full-text search across entire meeting)
+        3. Recent conversation turns
+        """
         parts = []
-        rag = self._search_memory(user_text, top_k=3)
-        if rag:
-            parts.append(f"Relevant memory: {' | '.join(rag)}")
+
+        # Search keyword memory
+        mem_hits = self._search_memory(user_text, top_k=3)
+        # Search full meeting log
+        log_hits = self._search_meeting_log(user_text, top_k=3)
+
+        # Combine and deduplicate
+        all_memory = []
+        seen = set()
+        for item in mem_hits + log_hits:
+            if item not in seen:
+                seen.add(item)
+                all_memory.append(item)
+
+        if all_memory:
+            parts.append(f"Meeting memory (earlier discussions):\n" + "\n".join(all_memory[:5]))
+
         if context:
             recent = "\n".join(context.split("\n")[-4:])
             parts.append(f"Recent conversation:\n{recent}")
+
         parts.append(f"User: {user_text}")
         return "\n".join(parts)
 
     # ── Search signal detection ───────────────────────────────────────────────
 
     def _is_search_signal(self, text: str) -> bool:
-        """Check if LLM returned [SEARCH]. 4o-mini is reliable — no hacky fallbacks needed."""
         upper = text.strip().upper()
         if upper.strip("[]").strip() == "SEARCH":
             return True
@@ -179,7 +253,7 @@ class PMAgent:
     # ── LLM search query conversion ──────────────────────────────────────────
 
     async def _to_english_search_query(self, user_text: str, context: str) -> str:
-        """LLM converts user message to clean English search query (~300ms)."""
+        """LLM converts user message to clean English search query (~200ms on Groq)."""
         clean = re.sub(r'\[LANG:\w+\]\s*', '', user_text).strip()
 
         context_hint = ""
@@ -204,17 +278,12 @@ class PMAgent:
             print(f"[Agent] Query conversion failed: {e}")
             return clean
 
-    # ── Core: respond (non-streaming, used by webhook_server) ────────────────
+    # ── Core: respond (non-streaming) ────────────────────────────────────────
 
     async def respond(self, user_text: str) -> str:
         return await self.respond_with_context(user_text, "")
 
-    async def respond_with_context(
-        self,
-        user_text: str,
-        context: str,
-        interrupted: bool = False,
-    ) -> str:
+    async def respond_with_context(self, user_text: str, context: str, interrupted: bool = False) -> str:
         self._store_memory(user_text)
         full_text = self._build_context(user_text, context)
 
@@ -224,6 +293,7 @@ class PMAgent:
         response = await self._llm_call(full_text, UNIFIED_PROMPT, max_tokens=60)
 
         if not self._is_search_signal(response):
+            self._store_memory(response)
             return response
 
         # Web search
@@ -243,19 +313,14 @@ class PMAgent:
 
     # ── Core: streaming (used by websocket_server) ───────────────────────────
 
-    async def stream_sentences_to_queue(
-        self,
-        user_text: str,
-        context: str,
-        queue: asyncio.Queue,
-    ):
+    async def stream_sentences_to_queue(self, user_text: str, context: str, queue: asyncio.Queue):
         self._store_memory(user_text)
         full_text = self._build_context(user_text, context)
 
-        # Step 1: Quick check — answer or [SEARCH]?
+        # Step 1: Check [SEARCH]
         self.history.append({"role": "user", "content": full_text})
-        if len(self.history) > 8:
-            self.history = self.history[-8:]
+        if len(self.history) > 10:
+            self.history = self.history[-10:]
 
         try:
             check = await self.client.chat.completions.create(
@@ -280,7 +345,7 @@ class PMAgent:
             await queue.put(None)
             return
 
-        # Path B: Web search — filler plays while LLM converts + searches
+        # Path B: Web search
         print(f"[Agent] LLM said [SEARCH] — searching: {user_text}")
         import random
         filler = random.choice(FILLERS)
@@ -333,9 +398,10 @@ class PMAgent:
             if buffer.strip():
                 await queue.put(buffer.strip())
 
+            full_response = full_response.strip()
             self.history.append({"role": "user",      "content": user_text})
-            self.history.append({"role": "assistant", "content": full_response.strip()})
-            self._store_memory(full_response.strip())
+            self.history.append({"role": "assistant", "content": full_response})
+            self._store_memory(full_response)
 
         except Exception as e:
             print(f"[Agent] Search stream failed: {e}")
@@ -347,8 +413,8 @@ class PMAgent:
 
     async def _llm_call(self, user_msg: str, system: str, max_tokens: int = 60) -> str:
         self.history.append({"role": "user", "content": user_msg})
-        if len(self.history) > 8:
-            self.history = self.history[-8:]
+        if len(self.history) > 10:
+            self.history = self.history[-10:]
 
         stream = await self.client.chat.completions.create(
             model=self.model,
@@ -366,7 +432,6 @@ class PMAgent:
 
         result = "".join(tokens).strip()
         self.history.append({"role": "assistant", "content": result})
-        self._store_memory(result)
         return result
 
     def _split_sentences(self, text: str) -> list[str]:
@@ -376,3 +441,4 @@ class PMAgent:
     def reset(self):
         self.history.clear()
         self.memory.clear()
+        self.meeting_log.clear()
