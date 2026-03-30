@@ -1,168 +1,15 @@
-# """
-# Trigger.py
-# Fast-path triggers (no LLM call) cover ~80% of cases:
-#   - Direct address ("sam") → YES immediately
-#   - Trivial fillers → NO immediately
-#   - Incomplete endings → wait
-#   - Memory recall keywords → YES immediately
-#   - Question ending "?" → YES immediately
-#   - 2+ PM keywords → YES immediately
-#   - Recent follow-up (< 3s) → YES immediately
-#   - Cooldown gate → NO
-#   - Ambiguous phrases → LLM decision (~200-700ms)
-# """
-
-# import time
-# import os
-# from openai import AsyncOpenAI
-
-# COOLDOWN_SECONDS = 1.5
-
-# TRIGGER_PROMPT = """You are Sam, a senior Project Manager in a live meeting.
-# Your job is to decide whether YOU should speak next.
-
-# Context:
-# {context}
-
-# Relevant past memory:
-# {memory}
-
-# Latest message from {speaker}: "{text}"
-
-# Say YES if:
-# - The message is directed at you explicitly or implicitly
-# - It is a question expecting your input
-# - It refers to something discussed earlier
-# - It feels like a follow-up to something you said
-# - The speaker seems to be waiting for your response
-# - Someone greets the group — greet back
-
-# Say NO if:
-# - The message is clearly directed to someone else by name
-# - Two other people are talking to each other
-# - It is just filler, acknowledgment, or side chatter
-# - The speaker is clearly mid-sentence (ends with "and", "so", "but", "the")
-
-# Reply ONLY with YES or NO.
-# """
-
-# PM_KEYWORDS = [
-#     "deadline", "deliver", "blocker", "issue", "plan", "decide",
-#     "approved", "timeline", "task", "owner", "risk", "budget",
-#     "scope", "stakeholder", "milestone", "sprint", "feature",
-#     "requirement", "sign-off", "contract", "report", "project",
-#     "team", "priority", "update", "review", "status", "delay",
-#     "launch", "release", "client", "dependency", "estimate",
-# ]
-
-# FILLERS = {
-#     "okay", "ok", "sure", "thanks", "thank you", "yep", "nope",
-#     "alright", "hmm", "uh huh", "got it", "bye", "yeah", "yes",
-#     "no", "cool", "nice", "great", "perfect", "sounds good",
-#     "i see", "right", "okay okay", "ok ok",
-# }
-
-# INCOMPLETE_ENDINGS = {
-#     "and", "so", "then", "but", "the", "a", "an", "or", "if", "when"
-# }
-
-# RECALL_KEYWORDS = [
-#     "before", "earlier", "told you", "mentioned",
-#     "remember", "what did i say", "recall", "last time",
-#     "previously", "you said",
-# ]
-
-
-# class TriggerDetector:
-#     def __init__(self):
-#         self._last_response_at: float = 0.0
-#         self._client = AsyncOpenAI(
-#             api_key=os.environ["GROQ_API_KEY"],
-#             base_url="https://api.groq.com/openai/v1",
-#         )
-
-#     async def should_respond(
-#         self,
-#         text: str,
-#         speaker: str = "Unknown",
-#         context: str = "",
-#         memory: list[str] | None = None,
-#     ) -> bool:
-#         now   = time.monotonic()
-#         lower = text.lower().strip()
-
-#         # Direct address — always YES, instant
-#         if "sam" in lower:
-#             self._last_response_at = 0
-#             print("  ⚡ Direct address — YES")
-#             return True
-
-#         # Trivial fillers — always NO, instant
-#         if lower in FILLERS:
-#             return False
-
-#         # Incomplete sentence — wait
-#         words     = lower.split()
-#         last_word = words[-1] if words else ""
-#         if last_word in INCOMPLETE_ENDINGS:
-#             print("  ⏸ Incomplete — waiting")
-#             return False
-
-#         # Memory recall — always YES, instant
-#         if any(k in lower for k in RECALL_KEYWORDS):
-#             print("  🧠 Recall detected — YES")
-#             return True
-
-#         # Question ending — almost always directed at Sam in 1:1 context
-#         if lower.endswith("?"):
-#             print("  ❓ Question — YES")
-#             return True
-
-#         # 2+ PM keywords — relevant to Sam's domain
-#         pm_hits = {k for k in PM_KEYWORDS if k in lower}
-#         if len(pm_hits) >= 2:
-#             print(f"  🏷️  PM keywords ({pm_hits}) — YES")
-#             return True
-
-#         # Recent follow-up boost
-#         if now - self._last_response_at < 3:
-#             print("  🔁 Follow-up boost — YES")
-#             return True
-
-#         # Cooldown gate
-#         if now - self._last_response_at < COOLDOWN_SECONDS:
-#             return False
-
-#         # LLM decision — only hits here for ambiguous phrases
-#         memory_hint = "\n".join(memory[-5:]) if memory else "None"
-#         return await self._groq_decide(text, speaker, context, memory_hint)
-
-#     async def _groq_decide(
-#         self, text: str, speaker: str, context: str, memory: str
-#     ) -> bool:
-#         try:
-#             response = await self._client.chat.completions.create(
-#                 model="llama-3.1-8b-instant",
-#                 messages=[{
-#                     "role": "user",
-#                     "content": TRIGGER_PROMPT.format(
-#                         context=context or "No prior context",
-#                         speaker=speaker,
-#                         text=text,
-#                         memory=memory,
-#                     )
-#                 }],
-#                 temperature=0,
-#                 max_tokens=3,
-#             )
-#             decision = response.choices[0].message.content.strip().upper()
-#             return "YES" in decision
-
 """
-Trigger.py — OPTIMIZED
-Changes:
-  1. Broader fast-path patterns ("about you", "tell me", etc.) → instant YES
-  2. Groq LLM fallback capped at 500ms → default YES on timeout
+Trigger.py — Should Sam respond?
+
+Fast-path patterns cover ~80% of cases (0-3ms):
+  - Direct address ("sam", "tell me", "can you") → YES
+  - Trivial fillers → NO
+  - Incomplete endings → wait
+  - Questions ending "?" → YES
+  - 2+ PM keywords → YES
+  - Recent follow-up (<3s) → YES
+
+LLM fallback for ambiguous cases — capped at 500ms, defaults YES on timeout.
 """
 
 import time
@@ -172,33 +19,21 @@ from openai import AsyncOpenAI
 
 COOLDOWN_SECONDS = 1.5
 
-TRIGGER_PROMPT = """You are Sam, a senior Project Manager in a live meeting.
-Your job is to decide whether YOU should speak next.
+TRIGGER_PROMPT = """You are Sam, a senior PM in a live meeting.
+Decide whether YOU should speak next.
 
 Context:
 {context}
 
-Relevant past memory:
+Memory:
 {memory}
 
-Latest message from {speaker}: "{text}"
+Latest from {speaker}: "{text}"
 
-Say YES if:
-- The message is directed at you explicitly or implicitly
-- It is a question expecting your input
-- It refers to something discussed earlier
-- It feels like a follow-up to something you said
-- The speaker seems to be waiting for your response
-- Someone greets the group — greet back
+YES if: directed at you, question expecting your input, follow-up, greeting.
+NO if: directed at someone else, two others talking, filler/acknowledgment, mid-sentence.
 
-Say NO if:
-- The message is clearly directed to someone else by name
-- Two other people are talking to each other
-- It is just filler, acknowledgment, or side chatter
-- The speaker is clearly mid-sentence (ends with "and", "so", "but", "the")
-
-Reply ONLY with YES or NO.
-"""
+Reply ONLY: YES or NO."""
 
 PM_KEYWORDS = [
     "deadline", "deliver", "blocker", "issue", "plan", "decide",
@@ -214,30 +49,26 @@ FILLERS = {
     "alright", "hmm", "uh huh", "got it", "bye", "yeah", "yes",
     "no", "cool", "nice", "great", "perfect", "sounds good",
     "i see", "right", "okay okay", "ok ok",
-    # Extended fillers
-    "interesting", "i see", "noted", "understood", "makes sense",
+    "interesting", "noted", "understood", "makes sense",
     "fair enough", "true", "exactly", "absolutely", "definitely",
     "of course", "certainly", "indeed", "wow", "oh", "ah",
     "mhm", "mm", "uh", "um", "hm", "okay sam", "ok sam",
-    "stop", "stop sam", "wait", "hold on", "one sec", "one second",
+    "stop", "stop sam", "wait", "hold on", "one sec",
 }
 
-INCOMPLETE_ENDINGS = {
-    "and", "so", "then", "but", "the", "a", "an", "or", "if", "when"
-}
+INCOMPLETE_ENDINGS = {"and", "so", "then", "but", "the", "a", "an", "or", "if", "when"}
+
+DIRECT_ADDRESS = [
+    "sam", "about you", "about yourself", "tell me",
+    "what do you", "can you", "could you", "would you",
+    "your opinion", "your thoughts", "what's your",
+    "introduce yourself", "who are you",
+]
 
 RECALL_KEYWORDS = [
     "before", "earlier", "told you", "mentioned",
     "remember", "what did i say", "recall", "last time",
     "previously", "you said",
-]
-
-# NEW: broader patterns that clearly need Sam to respond
-DIRECT_ADDRESS_PATTERNS = [
-    "sam", "about you", "about yourself", "tell me",
-    "what do you", "can you", "could you", "would you",
-    "your opinion", "your thoughts", "what's your",
-    "introduce yourself", "who are you",
 ]
 
 
@@ -249,89 +80,78 @@ class TriggerDetector:
             base_url="https://api.groq.com/openai/v1",
         )
 
-    async def should_respond(
-        self,
-        text: str,
-        speaker: str = "Unknown",
-        context: str = "",
-        memory: list[str] | None = None,
-    ) -> bool:
+    async def should_respond(self, text, speaker="Unknown", context="", memory=None) -> bool:
         now   = time.monotonic()
         lower = text.lower().strip()
 
-        # Direct address patterns — instant YES
-        if any(p in lower for p in DIRECT_ADDRESS_PATTERNS):
+        # Direct address — instant YES
+        if any(p in lower for p in DIRECT_ADDRESS):
             self._last_response_at = 0
             print("  ⚡ Direct address — YES")
             return True
 
-        # Trivial fillers — instant NO
+        # Fillers — instant NO
         if lower in FILLERS:
             return False
 
-        # Incomplete sentence — wait
-        words     = lower.split()
-        last_word = words[-1] if words else ""
+        # Incomplete — wait
+        last_word = lower.split()[-1] if lower.split() else ""
         if last_word in INCOMPLETE_ENDINGS:
             print("  ⏸ Incomplete — waiting")
             return False
 
-        # Memory recall — instant YES
+        # Recall — YES
         if any(k in lower for k in RECALL_KEYWORDS):
-            print("  🧠 Recall detected — YES")
+            print("  🧠 Recall — YES")
             return True
 
-        # Question ending — YES
+        # Question — YES
         if lower.endswith("?"):
             print("  ❓ Question — YES")
             return True
 
         # 2+ PM keywords — YES
-        pm_hits = {k for k in PM_KEYWORDS if k in lower}
-        if len(pm_hits) >= 2:
-            print(f"  🏷️  PM keywords ({pm_hits}) — YES")
+        hits = {k for k in PM_KEYWORDS if k in lower}
+        if len(hits) >= 2:
+            print(f"  🏷️  PM keywords ({hits}) — YES")
             return True
 
-        # Recent follow-up boost
+        # Follow-up boost
         if now - self._last_response_at < 3:
-            print("  🔁 Follow-up boost — YES")
+            print("  🔁 Follow-up — YES")
             return True
 
-        # Cooldown gate
+        # Cooldown
         if now - self._last_response_at < COOLDOWN_SECONDS:
             return False
 
-        # LLM decision — CAPPED at 500ms, default YES on timeout
-        memory_hint = "\n".join(memory[-5:]) if memory else "None"
-        return await self._groq_decide(text, speaker, context, memory_hint)
+        # LLM fallback — 500ms cap
+        mem_hint = "\n".join(memory[-5:]) if memory else "None"
+        return await self._llm_decide(text, speaker, context, mem_hint)
 
-    async def _groq_decide(
-        self, text: str, speaker: str, context: str, memory: str
-    ) -> bool:
+    async def _llm_decide(self, text, speaker, context, memory) -> bool:
         try:
-            response = await asyncio.wait_for(
+            resp = await asyncio.wait_for(
                 self._client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[{
                         "role": "user",
                         "content": TRIGGER_PROMPT.format(
-                            context=context or "No prior context",
-                            speaker=speaker,
-                            text=text,
-                            memory=memory,
+                            context=context or "No context",
+                            speaker=speaker, text=text, memory=memory,
                         )
                     }],
                     temperature=0,
                     max_tokens=3,
                 ),
-                timeout=0.5,  # 500ms hard cap
+                timeout=0.5,
             )
-            decision = response.choices[0].message.content.strip().upper()
+            decision = resp.choices[0].message.content.strip().upper()
             result = "YES" in decision
             print(f"  🤖 LLM trigger: {'YES' if result else 'NO'}")
             return result
         except asyncio.TimeoutError:
-            print("  ⏱️  LLM trigger timeout — defaulting YES")
+            print("  ⏱️  Trigger timeout — defaulting YES")
             return True
         except Exception as e:
             print(f"[Trigger] Error: {e}")
