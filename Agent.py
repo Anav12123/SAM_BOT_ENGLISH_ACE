@@ -341,6 +341,33 @@ class PMAgent:
             print(f"[Agent] Query conversion failed: {e}")
             return clean
 
+    # ── Background search (runs independently, survives interrupts) ──────────
+
+    async def search_and_summarize(self, user_text: str, context: str) -> str:
+        """Full search pipeline. Returns summary text. Safe to run as background task."""
+        search_query = await self._to_english_search_query(user_text, context)
+        try:
+            results = await self._get_web_search().search(search_query)
+            if not results:
+                return "Hmm, couldn't find that online right now."
+            system = SEARCH_SUMMARY_PROMPT.format(search_results=results[:800])
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.5,
+                max_tokens=120,
+            )
+            answer = response.choices[0].message.content.strip()
+            self.history.append({"role": "user", "content": user_text})
+            self.history.append({"role": "assistant", "content": answer})
+            return answer
+        except Exception as e:
+            print(f"[Agent] search_and_summarize failed: {e}")
+            return "Hmm, I couldn't look that up right now."
+
     # ── Core: respond (non-streaming) ────────────────────────────────────────
 
     async def respond(self, user_text: str) -> str:
@@ -375,6 +402,7 @@ class PMAgent:
     # ── Core: streaming (used by websocket_server) ───────────────────────────
 
     async def stream_sentences_to_queue(self, user_text: str, context: str, queue: asyncio.Queue):
+        """Stream PM response sentences to queue. PM-only — [FT] handled by websocket_server."""
         import time as _t
 
         t0 = _t.time()
@@ -382,74 +410,6 @@ class PMAgent:
         rag_ms = (_t.time() - t0) * 1000
         print(f"[Agent] ⏱ RAG context: {rag_ms:.0f}ms")
 
-        # ── STEP 1: Fast route (~100ms) ──────────────────────────────────
-        route = await self._route(user_text)
-
-        # ── STEP 2: If [FT] → filler + search (skip main LLM entirely) ──
-        if route == "FT":
-            import random
-            filler = random.choice(FILLERS)
-            await queue.put(filler)
-            await queue.put("__FLUSH__")
-            print(f"[Agent] Filler: \"{filler}\"")
-
-            search_query = await self._to_english_search_query(user_text, context)
-
-            try:
-                results = await self._get_web_search().search(search_query)
-                if not results:
-                    await queue.put("Hmm, couldn't find that online right now.")
-                    await queue.put(None)
-                    return
-
-                print(f"[Agent] Got results, streaming summary...")
-                system = SEARCH_SUMMARY_PROMPT.format(search_results=results[:800])
-
-                stream = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user",   "content": user_text},
-                    ],
-                    temperature=0.5,
-                    max_tokens=120,
-                    stream=True,
-                )
-
-                buffer = ""
-                full_response = ""
-                async for chunk in stream:
-                    token = chunk.choices[0].delta.content if chunk.choices else None
-                    if not token:
-                        continue
-                    buffer += token
-                    full_response += token
-
-                    while True:
-                        indices = [buffer.find(c) for c in ".!?" if buffer.find(c) != -1]
-                        if not indices:
-                            break
-                        idx = min(indices)
-                        sentence = buffer[:idx+1].strip()
-                        buffer = buffer[idx+1:].lstrip()
-                        if sentence:
-                            await queue.put(sentence)
-
-                if buffer.strip():
-                    await queue.put(buffer.strip())
-
-                full_response = full_response.strip()
-                self.history.append({"role": "user",      "content": user_text})
-                self.history.append({"role": "assistant", "content": full_response})
-
-            except Exception as e:
-                print(f"[Agent] Search stream failed: {e}")
-                await queue.put("Hmm, I couldn't look that up right now.")
-            finally:
-                await queue.put(None)
-            return
-
-        # ── STEP 3: If [PM] → stream PM response ────────────────────────
         self.history.append({"role": "user", "content": full_text})
         if len(self.history) > 4:
             self.history = self.history[-4:]
