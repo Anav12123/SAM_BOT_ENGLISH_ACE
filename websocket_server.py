@@ -239,17 +239,23 @@ class WebSocketServer:
             try:
                 pcm_bytes = base64.b64decode(audio_b64)
                 confidences = self._vad.process_chunk(pcm_bytes)
-                for conf in confidences:
-                    self._vad.update_state(conf, threshold=0.5)
 
-                # Debug logging
+                # Lower threshold for mixed meeting audio (Recall.ai audio is quieter)
+                for conf in confidences:
+                    self._vad.update_state(conf, threshold=0.3)
+
+                # Debug logging — track max confidence to calibrate threshold
                 if not hasattr(self, '_audio_event_count'):
                     self._audio_event_count = 0
+                    self._max_conf = 0.0
                 self._audio_event_count += 1
+                if confidences:
+                    self._max_conf = max(self._max_conf, max(confidences))
+
                 if self._audio_event_count == 1:
                     print(f"[{ts()}] 🔊 First audio_mixed_raw received ({len(pcm_bytes)} bytes)")
-                elif self._audio_event_count % 500 == 0:
-                    print(f"[{ts()}] 🔊 Audio events: {self._audio_event_count}, speaking={self._vad.is_speaking}, conf={self._vad.last_confidence:.2f}")
+                elif self._audio_event_count % 100 == 0:
+                    print(f"[{ts()}] 🔊 Audio#{self._audio_event_count} speaking={self._vad.is_speaking} conf={self._vad.last_confidence:.3f} max_conf={self._max_conf:.3f} silence={self._vad.silence_duration_ms():.0f}ms buf={len(self._buffer)}")
 
                 # ── VAD-triggered flush: speech detected → sustained silence → flush
                 if self._vad.is_speaking and self._buffer and not self._speaking:
@@ -257,7 +263,6 @@ class WebSocketServer:
                     word_count = sum(len(txt.split()) for _, txt, _ in self._buffer)
                     if silence_ms >= self.VAD_SILENCE_MS and word_count >= self.VAD_MIN_WORDS:
                         print(f"[{ts()}] 🎯 VAD flush: {silence_ms:.0f}ms silence, {word_count} words buffered")
-                        # Cancel debounce — VAD is handling flush
                         if self._buffer_task and not self._buffer_task.done():
                             self._buffer_task.cancel()
                         self._flush_buffer()
