@@ -433,8 +433,10 @@ class WebSocketServer:
             self._speaking = False
 
     async def start(self):
-        # Start RAG background embedder
+        # Start RAG background embedder + Groq warmup
         self.agent.start()
+        # Warm up Cartesia connection + validate keys
+        await self.speaker.warmup()
 
         runner = web.AppRunner(self.app)
         await runner.setup()
