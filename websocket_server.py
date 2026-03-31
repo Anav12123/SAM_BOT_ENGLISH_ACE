@@ -63,7 +63,7 @@ class WebSocketServer:
         self._buffer_task: asyncio.Task | None = None
 
         # TTS rate limiter
-        self._tts_semaphore = asyncio.Semaphore(2)
+        self._tts_semaphore = asyncio.Semaphore(4)
 
         self.app = web.Application()
         self.app.router.add_get("/ws",     self.handle_websocket)
