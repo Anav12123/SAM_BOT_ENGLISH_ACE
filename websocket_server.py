@@ -257,25 +257,21 @@ class WebSocketServer:
                 llm_task.cancel()
                 return
 
-            # Pipeline: collect sentences, fire TTS in parallel, inject in order
+            # True streaming: inject sentence 1 ASAP, prefetch next during playback
             all_sentences:  list[str] = []
-            tts_futures:    list[tuple[str, asyncio.Task]] = []  # (sentence, tts_task)
             filler_played = False
+            pending_tts:    list[tuple[str, asyncio.Task]] = []  # queued (sentence, tts_task)
 
             while True:
                 if self._interrupt_event.is_set() or my_gen != self._generation:
                     print(f"[{ts()}] ⚡ Superseded — aborting")
                     llm_task.cancel()
-                    for _, task in tts_futures:
-                        task.cancel()
+                    for _, t in pending_tts:
+                        t.cancel()
                     return
 
                 try:
-                    t_q = time.time()
                     item = await asyncio.wait_for(sentence_queue.get(), timeout=15.0)
-                    wait_ms = (time.time() - t_q) * 1000
-                    if item and item != "__FLUSH__" and item is not None:
-                        print(f"[{ts()}] ⏱ Queue wait: {wait_ms:.0f}ms")
                 except asyncio.TimeoutError:
                     print(f"[{ts()}] ⚠️  LLM queue timeout")
                     break
@@ -283,15 +279,15 @@ class WebSocketServer:
                 if item is None:
                     break
 
-                # Filler — TTS + inject immediately, then continue collecting
+                # Filler — inject immediately
                 if item == "__FLUSH__":
-                    if tts_futures:
+                    if pending_tts:
+                        sent, task = pending_tts.pop(0)
                         print(f"[{ts()}] 🗣️ Flushing filler...")
-                        sent, task = tts_futures[0]
                         try:
                             audio = await task
-                            b64 = base64.b64encode(audio).decode("utf-8")
                             if not (self._interrupt_event.is_set() or my_gen != self._generation):
+                                b64 = base64.b64encode(audio).decode("utf-8")
                                 tf = time.time()
                                 await self.speaker._inject_into_meeting(b64)
                                 self._audio_playing = True
@@ -300,8 +296,8 @@ class WebSocketServer:
                                 filler_dur = max(500, len(sent.split()) * 300)
                                 try:
                                     await asyncio.wait_for(self._interrupt_event.wait(), timeout=filler_dur/1000)
-                                    print(f"[{ts()}] ⚡ Interrupted during filler")
-                                    self._log_sam(f"{sent} [interrupted]")
+                                    all_sentences.append(sent)
+                                    self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
                                     self.trigger.mark_responded()
                                     llm_task.cancel()
                                     return
@@ -311,58 +307,85 @@ class WebSocketServer:
                         except Exception as e:
                             print(f"[{ts()}] ⚠️  Filler TTS failed: {e}")
                         all_sentences.append(sent)
-                        tts_futures.clear()
                     continue
 
-                # Normal sentence — fire TTS immediately (non-blocking)
+                # Normal sentence — fire TTS immediately
                 all_sentences.append(item)
                 idx = len(all_sentences)
                 print(f"[{ts()}] LLM sentence {idx} ({elapsed(t1)}): \"{item}\"")
-                tts_futures.append((item, asyncio.create_task(self._tts(item))))
+                pending_tts.append((item, asyncio.create_task(self._tts(item))))
 
-            # Now inject each sentence in order as TTS completes
-            for i, (sent, task) in enumerate(tts_futures):
+                # INJECT FIRST SENTENCE IMMEDIATELY — don't wait for more
+                if idx == 1:
+                    sent, task = pending_tts.pop(0)
+                    try:
+                        t_tts = time.time()
+                        audio_bytes = await task
+                        print(f"[{ts()}] ⏱ TTS sentence 1: {elapsed(t_tts)}")
+
+                        if self._interrupt_event.is_set() or my_gen != self._generation:
+                            return
+
+                        t_inj = time.time()
+                        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                        await self.speaker._inject_into_meeting(b64)
+                        self._audio_playing = True
+                        print(f"[{ts()}] ⏱ Inject sentence 1: {elapsed(t_inj)}")
+                        if not filler_played:
+                            print(f"[{ts()}] 📊 FIRST AUDIO: {elapsed(t0)}")
+
+                        # Wait for playback — LLM + TTS for sentence 2 run during this!
+                        word_count = len(sent.split())
+                        play_dur = max(300, word_count * 280)
+                        try:
+                            await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur/1000)
+                            self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
+                            self.trigger.mark_responded()
+                            llm_task.cancel()
+                            for _, t in pending_tts:
+                                t.cancel()
+                            return
+                        except asyncio.TimeoutError:
+                            pass
+                        self._audio_playing = False
+                    except Exception as e:
+                        print(f"[{ts()}] ⚠️  TTS sentence 1 failed: {e}")
+
+            # Inject remaining sentences (TTS already running/done from prefetch)
+            for i, (sent, task) in enumerate(pending_tts):
                 if self._interrupt_event.is_set() or my_gen != self._generation:
-                    for _, t in tts_futures[i:]:
+                    for _, t in pending_tts[i:]:
                         t.cancel()
                     return
 
                 try:
                     t_tts = time.time()
                     audio_bytes = await task
-                    tts_ms = (time.time() - t_tts) * 1000
-                    print(f"[{ts()}] ⏱ TTS sentence {i+1}: {tts_ms:.0f}ms")
+                    print(f"[{ts()}] ⏱ TTS sentence {i+2}: {elapsed(t_tts)}")
+
+                    if self._interrupt_event.is_set() or my_gen != self._generation:
+                        return
+
+                    t_inj = time.time()
+                    b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    await self.speaker._inject_into_meeting(b64)
+                    self._audio_playing = True
+                    print(f"[{ts()}] ⏱ Inject sentence {i+2}: {elapsed(t_inj)}")
+
+                    word_count = len(sent.split())
+                    play_dur = max(300, word_count * 280)
+                    try:
+                        await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur/1000)
+                        self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
+                        self.trigger.mark_responded()
+                        for _, t in pending_tts[i+1:]:
+                            t.cancel()
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    self._audio_playing = False
                 except Exception as e:
-                    print(f"[{ts()}] ⚠️  TTS failed sentence {i+1}: {e}")
-                    continue
-
-                if self._interrupt_event.is_set() or my_gen != self._generation:
-                    return
-
-                t_inj = time.time()
-                b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                await self.speaker._inject_into_meeting(b64)
-                self._audio_playing = True
-                inject_ms = (time.time() - t_inj) * 1000
-                print(f"[{ts()}] ⏱ Inject sentence {i+1}: {inject_ms:.0f}ms")
-
-                if i == 0 and not filler_played:
-                    print(f"[{ts()}] 📊 FIRST AUDIO: {elapsed(t0)}")
-
-                # Wait for playback before injecting next
-                word_count = len(sent.split())
-                play_dur = max(300, word_count * 280)
-                try:
-                    await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur/1000)
-                    print(f"[{ts()}] ⚡ Interrupted during playback")
-                    self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
-                    self.trigger.mark_responded()
-                    for _, t in tts_futures[i+1:]:
-                        t.cancel()
-                    return
-                except asyncio.TimeoutError:
-                    pass
-                self._audio_playing = False
+                    print(f"[{ts()}] ⚠️  TTS sentence {i+2} failed: {e}")
 
             if not all_sentences:
                 return
