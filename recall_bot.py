@@ -46,7 +46,7 @@ class RecallBot:
                         }
                     }
                 },
-                "audio_mixed_raw": {},
+                "audio_separate_raw": {},
                 "realtime_endpoints": [{
                     "type":   "websocket",
                     "url":    websocket_url,
@@ -57,7 +57,7 @@ class RecallBot:
                         "participant_events.speech_off",
                         "participant_events.join",
                         "participant_events.leave",
-                        "audio_mixed_raw.data",
+                        "audio_separate_raw.data",
                     ]
                 }]
             },
