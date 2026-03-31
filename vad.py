@@ -71,6 +71,10 @@ class SileroVAD:
             print(f"[VAD] ⚠️  Setup failed: {e} — VAD disabled, using speech_off fallback")
             self._ready = False
 
+    # Recall.ai mixed audio is much quieter than direct microphone
+    # Amplify before feeding to Silero which was trained on direct mic input
+    AUDIO_GAIN = 10.0
+
     def _reset_state(self):
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._audio_buffer = np.array([], dtype=np.float32)
@@ -81,6 +85,10 @@ class SileroVAD:
             return []
 
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # Amplify quiet meeting audio — clip to [-1, 1] to prevent distortion
+        samples = np.clip(samples * self.AUDIO_GAIN, -1.0, 1.0)
+
         self._audio_buffer = np.concatenate([self._audio_buffer, samples])
 
         confidences = []
