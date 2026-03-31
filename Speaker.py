@@ -264,7 +264,6 @@ class CartesiaSpeaker:
     def __init__(self, bot_id: str = None):
         import Speaker as _self_module
         print(f"[Speaker] Loaded from: {_self_module.__file__}")
-        self.elevenlabs_key = os.environ["ELEVENLABS_API_KEY"]
         self.recall_key     = os.environ["RECALLAI_API_KEY"]
         self.bot_id         = bot_id
 
@@ -284,18 +283,22 @@ class CartesiaSpeaker:
         self._base_noise = self._noise_slices if self._noise_slices else None
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
 
-        self._elevenlabs_client  = httpx.AsyncClient(timeout=30, limits=limits)  # http2 disabled — avoids connection reuse bugs
-        self._elevenlabs_headers = {
-            "xi-api-key":   self.elevenlabs_key,
-            "Content-Type": "application/json",
-        }
+        # ── Multi-key Cartesia setup ─────────────────────────────────────
+        self._cartesia_keys = []
+        # Collect all CARTESIA keys from env
+        for key_name in ["CARTESIA_API_KEY", "CARTESIA_API_KEY_2", "CARTESIA_API_KEY_3", "CARTESIA_API_KEY_4", "CARTESIA_API_KEY_5"]:
+            val = os.environ.get(key_name, "").strip()
+            if val:
+                self._cartesia_keys.append(val)
 
-        self._cartesia_client  = httpx.AsyncClient(timeout=30, limits=limits)
-        self._cartesia_headers = {
-            "Authorization":    f"Bearer {os.environ['CARTESIA_API_KEY']}",
-            "Cartesia-Version": "2025-04-16",
-            "Content-Type":     "application/json",
-        }
+        if not self._cartesia_keys:
+            raise ValueError("No CARTESIA_API_KEY found in environment")
+
+        print(f"[Speaker] {len(self._cartesia_keys)} Cartesia key(s) loaded")
+        self._key_index = 0
+
+        # One shared client — headers swapped per request
+        self._cartesia_client = httpx.AsyncClient(timeout=30, limits=limits)
 
         self._recall_client  = httpx.AsyncClient(timeout=30, limits=limits)
         self._recall_headers = {
@@ -304,33 +307,24 @@ class CartesiaSpeaker:
             "accept":        "application/json",
         }
 
-    # ── INACTIVE: ElevenLabs TTS (blocked on free tier from non-browser) ─────
-    # async def _synthesise(self, text: str) -> bytes:
-    #     url = "https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb"
-    #     response = await self._elevenlabs_client.post(
-    #         url,
-    #         headers=self._elevenlabs_headers,
-    #         json={
-    #             "text":     text,
-    #             "model_id": "eleven_flash_v2_5",
-    #             "voice_settings": {
-    #                 "stability":         0.35,
-    #                 "similarity_boost":  0.75,
-    #                 "style":             0.0,
-    #                 "use_speaker_boost": True,
-    #             },
-    #             "output_format": "mp3_44100_64",
-    #         },
-    #     )
-    #     response.raise_for_status()
-    #     return response.content
+    def _next_cartesia_headers(self) -> dict:
+        """Round-robin key rotation — each TTS call uses a different key."""
+        key = self._cartesia_keys[self._key_index % len(self._cartesia_keys)]
+        self._key_index += 1
+        return {
+            "Authorization":    f"Bearer {key}",
+            "Cartesia-Version": "2025-04-16",
+            "Content-Type":     "application/json",
+        }
 
-    # ── ACTIVE: Cartesia Sonic-turbo TTS ─────────────────────────────────────
+    # ── ACTIVE: Cartesia Sonic-turbo TTS with key rotation ───────────────
     async def _synthesise(self, text: str) -> bytes:
-        print(f"[Speaker] TTS via Cartesia...")
+        headers = self._next_cartesia_headers()
+        key_num = (self._key_index - 1) % len(self._cartesia_keys) + 1
+        print(f"[Speaker] TTS via Cartesia (key #{key_num})...")
         response = await self._cartesia_client.post(
             "https://api.cartesia.ai/tts/bytes",
-            headers=self._cartesia_headers,
+            headers=headers,
             json={
                 "model_id":   "sonic-turbo",
                 "transcript": text,
@@ -377,16 +371,6 @@ class CartesiaSpeaker:
 
     async def close(self):
         await asyncio.gather(
-            self._elevenlabs_client.aclose(),
             self._cartesia_client.aclose(),
             self._recall_client.aclose(),
         )
-
-    # ── Convenience: TTS + encode in one call (used by _speak_response) ───────
-    async def synthesise_and_encode(self, text: str) -> tuple[str, int]:
-        """TTS → base64 encode. Returns (b64_string, estimated_duration_ms)."""
-        voice_bytes = await self._synthesise(text)
-        b64 = base64.b64encode(voice_bytes).decode("utf-8")
-        word_count = len(text.split())
-        duration_ms = max(500, word_count * 300)
-        return b64, duration_ms
