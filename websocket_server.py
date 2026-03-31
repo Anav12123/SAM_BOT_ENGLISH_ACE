@@ -251,8 +251,17 @@ class WebSocketServer:
                 confidences = self._vad.process_chunk(pcm_bytes)
                 for conf in confidences:
                     self._vad.update_state(conf, threshold=0.5)
-            except Exception:
-                pass
+
+                # Log first audio event + periodic updates
+                if not hasattr(self, '_audio_event_count'):
+                    self._audio_event_count = 0
+                self._audio_event_count += 1
+                if self._audio_event_count == 1:
+                    print(f"[{ts()}] 🔊 First audio_mixed_raw received ({len(pcm_bytes)} bytes)")
+                elif self._audio_event_count % 500 == 0:
+                    print(f"[{ts()}] 🔊 Audio events: {self._audio_event_count}, VAD speaking={self._vad.is_speaking}, conf={self._vad.last_confidence:.2f}")
+            except Exception as e:
+                print(f"[{ts()}] ⚠️  VAD process error: {e}")
 
         elif event == "participant_events.join":
             name = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
@@ -296,10 +305,15 @@ class WebSocketServer:
 
     async def _debounce_then_flush(self, speaker: str):
         try:
-            await asyncio.sleep(1.0)
+            # When VAD is active, debounce is just a safety net (5s)
+            # VAD + speech_off handles real flush timing
+            # Without VAD, flush after 1.0s of no new transcript (old behavior)
+            timeout = 5.0 if self._vad.ready else 1.0
+            await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
         if self._buffer and not self._speaking:
+            print(f"[{ts()}] ⏰ Debounce safety flush ({5.0 if self._vad.ready else 1.0}s)")
             self._flush_buffer()
 
     def _flush_buffer(self):
