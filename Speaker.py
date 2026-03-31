@@ -307,6 +307,41 @@ class CartesiaSpeaker:
             "accept":        "application/json",
         }
 
+    async def warmup(self):
+        """Pre-establish TCP to Cartesia + validate all keys. Call once after event loop starts."""
+        valid_keys = []
+        for i, key in enumerate(self._cartesia_keys):
+            try:
+                headers = {
+                    "Authorization": f"Bearer {key}",
+                    "Cartesia-Version": "2025-04-16",
+                    "Content-Type": "application/json",
+                }
+                response = await self._cartesia_client.post(
+                    "https://api.cartesia.ai/tts/bytes",
+                    headers=headers,
+                    json={
+                        "model_id": "sonic-turbo",
+                        "transcript": "hi",
+                        "voice": {"mode": "id", "id": "79a125e8-cd45-4c13-8a67-188112f4dd22"},
+                        "language": "en",
+                        "output_format": {"container": "mp3", "sample_rate": 44100, "bit_rate": 128000},
+                    },
+                )
+                if response.status_code in (200, 201):
+                    valid_keys.append(key)
+                    print(f"[Speaker] ✅ Cartesia key #{i+1} valid")
+                else:
+                    print(f"[Speaker] ❌ Cartesia key #{i+1} invalid ({response.status_code})")
+            except Exception as e:
+                print(f"[Speaker] ❌ Cartesia key #{i+1} failed: {e}")
+
+        if valid_keys:
+            self._cartesia_keys = valid_keys
+            print(f"[Speaker] ✅ {len(valid_keys)} valid key(s), Cartesia warmed up")
+        else:
+            print(f"[Speaker] ⚠️  No valid Cartesia keys!")
+
     def _next_cartesia_headers(self) -> dict:
         """Round-robin key rotation — each TTS call uses a different key."""
         key = self._cartesia_keys[self._key_index % len(self._cartesia_keys)]
