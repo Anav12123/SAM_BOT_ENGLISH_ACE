@@ -360,14 +360,23 @@ class PMAgent:
     # ── Core: streaming (used by websocket_server) ───────────────────────────
 
     async def stream_sentences_to_queue(self, user_text: str, context: str, queue: asyncio.Queue):
+        import time as _t
+
+        t0 = _t.time()
         full_text = await self._build_context(user_text, context)
+        rag_ms = (_t.time() - t0) * 1000
+        print(f"[Agent] ⏱ RAG context: {rag_ms:.0f}ms")
 
         self.history.append({"role": "user", "content": full_text})
         if len(self.history) > 6:
             self.history = self.history[-6:]
 
+        # Count tokens being sent
+        total_chars = len(UNIFIED_PROMPT) + sum(len(m["content"]) for m in self.history)
+        print(f"[Agent] ⏱ Context size: {total_chars} chars (~{total_chars//4} tokens)")
+
         try:
-            # Stream the response — push sentences to queue as they complete
+            t1 = _t.time()
             stream = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "system", "content": UNIFIED_PROMPT}] + self.history,
@@ -375,21 +384,29 @@ class PMAgent:
                 max_tokens=80,
                 stream=True,
             )
+            stream_open_ms = (_t.time() - t1) * 1000
+            print(f"[Agent] ⏱ Stream opened: {stream_open_ms:.0f}ms")
 
             buffer = ""
             full_response = ""
+            first_token_time = None
+            sentence_count = 0
             async for chunk in stream:
                 token = chunk.choices[0].delta.content if chunk.choices else None
                 if not token:
                     continue
+
+                if first_token_time is None:
+                    first_token_time = _t.time()
+                    ttft_ms = (first_token_time - t1) * 1000
+                    print(f"[Agent] ⏱ First token: {ttft_ms:.0f}ms")
+
                 buffer += token
                 full_response += token
 
-                # Check for [SEARCH] signal early — don't wait for full response
                 if self._is_search_signal(full_response):
                     break
 
-                # Push complete sentences immediately → TTS fires right away
                 while True:
                     indices = [buffer.find(c) for c in ".!?" if buffer.find(c) != -1]
                     if not indices:
@@ -398,7 +415,13 @@ class PMAgent:
                     sentence = buffer[:idx+1].strip()
                     buffer = buffer[idx+1:].lstrip()
                     if sentence:
+                        sentence_count += 1
+                        sent_ms = (_t.time() - t1) * 1000
+                        print(f"[Agent] ⏱ Sentence {sentence_count} ready: {sent_ms:.0f}ms")
                         await queue.put(sentence)
+
+            llm_total_ms = (_t.time() - t1) * 1000
+            print(f"[Agent] ⏱ LLM total: {llm_total_ms:.0f}ms ({len(full_response.split())} words)")
 
             first_answer = full_response.strip()
         except Exception as e:
