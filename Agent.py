@@ -367,24 +367,52 @@ class PMAgent:
             self.history = self.history[-10:]
 
         try:
-            check = await self.client.chat.completions.create(
+            # Stream the response — push sentences to queue as they complete
+            stream = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "system", "content": UNIFIED_PROMPT}] + self.history,
                 temperature=0.7,
                 max_tokens=80,
+                stream=True,
             )
-            first_answer = check.choices[0].message.content.strip()
+
+            buffer = ""
+            full_response = ""
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content if chunk.choices else None
+                if not token:
+                    continue
+                buffer += token
+                full_response += token
+
+                # Check for [SEARCH] signal early — don't wait for full response
+                if self._is_search_signal(full_response):
+                    break
+
+                # Push complete sentences immediately → TTS fires right away
+                while True:
+                    indices = [buffer.find(c) for c in ".!?" if buffer.find(c) != -1]
+                    if not indices:
+                        break
+                    idx = min(indices)
+                    sentence = buffer[:idx+1].strip()
+                    buffer = buffer[idx+1:].lstrip()
+                    if sentence:
+                        await queue.put(sentence)
+
+            first_answer = full_response.strip()
         except Exception as e:
             print(f"[Agent] LLM error: {e}")
             await queue.put("Hmm, something went wrong on my end.")
             await queue.put(None)
             return
 
-        # Path A: Direct answer
+        # Path A: Direct answer (sentences already pushed during streaming)
         if not self._is_search_signal(first_answer):
+            # Push any remaining buffer
+            if buffer.strip():
+                await queue.put(buffer.strip())
             self.history.append({"role": "assistant", "content": first_answer})
-            for sentence in self._split_sentences(first_answer):
-                await queue.put(sentence)
             await queue.put(None)
             return
 
