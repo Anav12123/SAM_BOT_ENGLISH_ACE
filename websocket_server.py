@@ -225,14 +225,19 @@ class WebSocketServer:
                 self._interrupt_event.set()
 
         # ── Raw audio → Silero VAD → self-triggered flush ─────────────────
-        elif event == "audio_mixed_raw.data":
+        elif event == "audio_separate_raw.data":
             if not self._vad.ready:
                 return
-            # Don't run VAD while bot is speaking (mixed audio includes bot's TTS)
-            if self._audio_playing:
+
+            inner = payload.get("data", {}).get("data", {})
+
+            # Skip bot's own audio
+            participant = inner.get("participant", {})
+            speaker_name = participant.get("name", "")
+            if speaker_name and speaker_name.lower() == "sam":
                 return
 
-            audio_b64 = payload.get("data", {}).get("data", {}).get("buffer", "")
+            audio_b64 = inner.get("buffer", "")
             if not audio_b64:
                 return
 
@@ -240,7 +245,6 @@ class WebSocketServer:
                 pcm_bytes = base64.b64decode(audio_b64)
                 confidences = self._vad.process_chunk(pcm_bytes)
 
-                # Lower threshold for mixed meeting audio (Recall.ai audio is quieter)
                 for conf in confidences:
                     self._vad.update_state(conf, threshold=0.08)
 
@@ -253,12 +257,12 @@ class WebSocketServer:
                     self._max_conf = max(self._max_conf, max(confidences))
 
                 if self._audio_event_count == 1:
-                    print(f"[{ts()}] 🔊 First audio_mixed_raw received ({len(pcm_bytes)} bytes)")
+                    print(f"[{ts()}] 🔊 First audio_separate_raw from '{speaker_name}' ({len(pcm_bytes)} bytes)")
                 elif self._audio_event_count % 100 == 0:
-                    print(f"[{ts()}] 🔊 Audio#{self._audio_event_count} speaking={self._vad.is_speaking} conf={self._vad.last_confidence:.3f} max_conf={self._max_conf:.3f} silence={self._vad.silence_duration_ms():.0f}ms buf={len(self._buffer)}")
+                    print(f"[{ts()}] 🔊 Audio#{self._audio_event_count} heard={self._vad.heard_speech} conf={self._vad.last_confidence:.3f} max={self._max_conf:.3f} silence={self._vad.silence_duration_ms():.0f}ms buf={len(self._buffer)}")
 
-                # ── VAD-triggered flush: speech detected → sustained silence → flush
-                if self._vad.is_speaking and self._buffer and not self._speaking:
+                # ── VAD-triggered flush: heard speech + sustained silence → flush
+                if self._vad.heard_speech and self._buffer and not self._speaking:
                     silence_ms = self._vad.silence_duration_ms()
                     word_count = sum(len(txt.split()) for _, txt, _ in self._buffer)
                     if silence_ms >= self.VAD_SILENCE_MS and word_count >= self.VAD_MIN_WORDS:
