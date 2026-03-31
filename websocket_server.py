@@ -221,6 +221,8 @@ class WebSocketServer:
             # Replace previous partial (partials grow: "Sam" → "Sam tell me" → "Sam tell me about")
             self._partial_text = text
             self._partial_speaker = speaker
+            # Restart debounce — receiving partials means user is still speaking
+            self._restart_debounce(speaker)
 
         # ── Speech OFF → fallback flush if VAD didn't catch it ──────────
         elif event == "participant_events.speech_off":
