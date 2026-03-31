@@ -116,9 +116,9 @@ class TriggerDetector:
             print(f"  🏷️  PM keywords ({hits}) — YES")
             return True
 
-        # Follow-up boost
-        if now - self._last_response_at < 3:
-            print("  🔁 Follow-up — YES")
+        # Follow-up boost — if Sam responded recently, likely still in conversation
+        if now - self._last_response_at < 15:
+            print("  🔁 Follow-up (within 15s) — YES")
             return True
 
         # Cooldown
