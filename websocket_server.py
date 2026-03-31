@@ -1,9 +1,19 @@
 """
-websocket_server.py — Streaming LLM + parallel TTS + filler words
+websocket_server.py — Production-grade streaming voice pipeline
 
 Pipeline:
-  Deepgram transcript → Trigger check → LLM streaming → parallel TTS → concat → inject
-  If [SEARCH]: filler plays instantly → LLM converts query → SerpAPI → LLM streams summary
+  Deepgram → Buffer+debounce → Trigger+Router parallel →
+    [PM] → LLM stream → sentence TTS → inject each ASAP
+    [FT] → filler inject → background search+TTS → inject or save pending
+
+Edge cases handled:
+  - Ack detection during search ("Sure", "OK", "Go ahead") → ignored
+  - Pending search queue → delivers after current response
+  - No overlapping audio ever — sequential inject + playback wait
+  - Same speaker continuation → rebuffer
+  - Different speaker interrupt → stop audio + process new
+  - Filler playback tracked as _speaking/_audio_playing
+  - Graceful crash handling in finally blocks
 """
 
 import asyncio
@@ -20,10 +30,6 @@ from Trigger import TriggerDetector
 from Agent import PMAgent, FILLERS
 from Speaker import CartesiaSpeaker, _mix_noise
 
-_ACK_PHRASES = {"sure", "ok", "okay", "yeah", "yes", "go ahead", "alright",
-                "right", "hmm", "mhm", "cool", "got it", "fine", "yep", "yup",
-                "carry on", "go on", "continue", "waiting", "i'm waiting"}
-
 
 def ts():
     return time.strftime("%H:%M:%S")
@@ -33,7 +39,15 @@ def elapsed(since: float) -> str:
 
 WORDS_PER_SECOND = 3.2
 
-# ── Fix Deepgram misrecognitions ──────────────────────────────────────────
+# ── Ack phrases — ignored during search ──────────────────────────────────────
+_ACK_PHRASES = frozenset({
+    "sure", "ok", "okay", "yeah", "yes", "go ahead", "alright",
+    "right", "hmm", "mhm", "cool", "got it", "fine", "yep", "yup",
+    "carry on", "go on", "continue", "waiting", "i'm waiting",
+    "i am waiting", "no problem", "take your time", "np",
+})
+
+# ── Fix Deepgram misrecognitions ─────────────────────────────────────────────
 _TRANSCRIPTION_FIXES = [
     (_re.compile(r'\b(?:NF\s*Cloud|Enuf\s*Cloud|Enough\s*Cloud|Nav\s*Cloud|Anav\s*Cloud|Arnav\s*Cloud|Anab\s*Cloud|NFClouds?|EnoughClouds?|NavClouds?|AnavCloud)\b', _re.IGNORECASE), 'AnavClouds'),
     (_re.compile(r'\b(?:Sales\s*Force|Sells\s*Force|Cells\s*Force|SalesForce)\b', _re.IGNORECASE), 'Salesforce'),
@@ -46,6 +60,11 @@ def _fix_transcription(text: str) -> str:
     if result != text:
         print(f"[Transcript Fix] \"{text}\" → \"{result}\"")
     return result
+
+def _is_ack(text: str) -> bool:
+    """Check if text is purely acknowledgement phrases."""
+    fragments = _re.split(r'[.!?,]+', text.strip().lower())
+    return all(f.strip() in _ACK_PHRASES or f.strip() == "" for f in fragments) and text.strip() != ""
 
 
 class WebSocketServer:
@@ -69,9 +88,10 @@ class WebSocketServer:
 
         # Search state
         self._searching = False
-        self._pending_searches: list[tuple[str, asyncio.Task]] = []  # (query_text, search_task)
+        # Pending: list of (query_text, prepare_task) where prepare_task returns list[(sentence, audio_bytes)]
+        self._pending_searches: list[tuple[str, asyncio.Task]] = []
 
-        # TTS rate limiter
+        # TTS rate limiter — matches number of Cartesia keys
         self._tts_semaphore = asyncio.Semaphore(4)
 
         self.app = web.Application()
@@ -79,7 +99,7 @@ class WebSocketServer:
         self.app.router.add_get("/health", self.handle_health)
 
     async def handle_health(self, request):
-        return web.json_response({"status": "ok", "speaking": self._speaking})
+        return web.json_response({"status": "ok", "speaking": self._speaking, "searching": self._searching})
 
     async def handle_websocket(self, request):
         ws = web.WebSocketResponse(heartbeat=30)
@@ -88,7 +108,10 @@ class WebSocketServer:
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    await self._handle_event(msg.data)
+                    try:
+                        await self._handle_event(msg.data)
+                    except Exception as e:
+                        print(f"[{ts()}] ⚠️  Event handler error: {e}")
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     print(f"[{ts()}] ⚠️  WS error: {ws.exception()}")
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
@@ -98,6 +121,10 @@ class WebSocketServer:
         finally:
             print(f"[{ts()}] WebSocket disconnected")
         return ws
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Event dispatch
+    # ══════════════════════════════════════════════════════════════════════════
 
     async def _handle_event(self, raw: str):
         t = time.time()
@@ -120,46 +147,45 @@ class WebSocketServer:
             text = _fix_transcription(text)
             print(f"\n[{ts()}] [{speaker}] {text}  ⏱ {elapsed(t)}")
 
-            # Store in RAG immediately (embedding happens async)
+            # Store in RAG immediately
             self.agent.log_exchange(speaker, text)
 
-            # During search, same speaker ack → ignore entirely
-            if self._searching and self._current_speaker == speaker:
-                clean = text.strip().lower().rstrip(".!?,")
-                if clean in _ACK_PHRASES:
+            # ── Edge case: Ack during search/pending → ignore ─────────
+            if (self._searching or self._pending_searches) and self._current_speaker == speaker:
+                if _is_ack(text):
                     print(f"[{ts()}] 🔕 Ack during search — ignored: \"{text}\"")
                     return
 
-            # Different speaker interrupts Sam — handle immediately
+            # ── Different speaker interrupts Sam ──────────────────────
             if self._speaking and self._current_speaker != speaker:
                 print(f"[{ts()}] ⚡ INTERRUPT — {speaker} cut in")
                 asyncio.create_task(self.speaker.stop_audio())
                 self._interrupt_event.set()
-                # Flush any buffer from the new speaker
                 self._buffer.clear()
                 self._buffer.append((speaker, text, t))
                 self._restart_debounce(speaker)
                 return
 
-            # Same speaker adds more while Sam is speaking — cancel and rebuffer
+            # ── Same speaker adds more while Sam is speaking ──────────
             if self._speaking and self._current_speaker == speaker:
-                if self._current_task and not self._current_task.done():
-                    self._current_task.cancel()
-                if self._audio_playing:
-                    asyncio.create_task(self.speaker.stop_audio())
-                self._speaking = False
-                self._audio_playing = False
-                self._interrupt_event.set()
+                # Don't cancel if we're in search — search continues in background
+                if not self._searching:
+                    if self._current_task and not self._current_task.done():
+                        self._current_task.cancel()
+                    if self._audio_playing:
+                        asyncio.create_task(self.speaker.stop_audio())
+                    self._speaking = False
+                    self._audio_playing = False
+                    self._interrupt_event.set()
 
-            # Buffer the fragment — don't process yet
+            # Buffer the fragment
             self._buffer.append((speaker, text, t))
             self._restart_debounce(speaker)
 
-        # ── Speech OFF — user stopped talking, flush buffer ───────────────
+        # ── Speech OFF → flush buffer ─────────────────────────────────────
         elif event == "participant_events.speech_off":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
             print(f"[{ts()}] 🔇 {speaker} stopped speaking")
-            # Cancel debounce timer — process immediately on speech_off
             if self._buffer_task and not self._buffer_task.done():
                 self._buffer_task.cancel()
             if self._buffer and not self._speaking:
@@ -184,6 +210,10 @@ class WebSocketServer:
             if name and name.lower() != "sam":
                 print(f"[{ts()}] 👋 {name} left")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Buffer + debounce
+    # ══════════════════════════════════════════════════════════════════════════
+
     def _start_process(self, text, speaker, t0):
         self._generation     += 1
         my_gen                = self._generation
@@ -198,21 +228,18 @@ class WebSocketServer:
             return
         greeting = f"Hey {name}, welcome to the call!"
         self._log_sam(greeting)
-        await self._speak_response(greeting, t0)
+        await self._speak_simple(greeting, t0)
 
     def _log_sam(self, text: str):
-        """Store Sam's response in both convo history and meeting log."""
         self._convo_history.append(f"Sam: {text}")
         self.agent.log_exchange("Sam", text)
 
     def _restart_debounce(self, speaker: str):
-        """Reset the silence timer. Process only after 1.5s of no new fragments."""
         if self._buffer_task and not self._buffer_task.done():
             self._buffer_task.cancel()
         self._buffer_task = asyncio.create_task(self._debounce_then_flush(speaker))
 
     async def _debounce_then_flush(self, speaker: str):
-        """Safety net: if speech_off doesn't fire, flush after 1.0s silence."""
         try:
             await asyncio.sleep(1.0)
         except asyncio.CancelledError:
@@ -221,7 +248,6 @@ class WebSocketServer:
             self._flush_buffer()
 
     def _flush_buffer(self):
-        """Combine all buffered fragments and start processing."""
         if not self._buffer:
             return
         speaker   = self._buffer[-1][0]
@@ -231,22 +257,22 @@ class WebSocketServer:
         print(f"[{ts()}] 📝 Buffered complete: \"{full_text}\"")
         self._start_process(full_text, speaker, t0)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # TTS + inject helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
     async def _tts(self, text: str) -> bytes:
         async with self._tts_semaphore:
             return await self.speaker._synthesise(text)
 
-    async def _inject_sentence(self, text: str, t0, label: str = "", my_gen: int = -1) -> bool:
-        """TTS + inject + interruptible playback. Returns False if interrupted."""
+    async def _inject_and_wait(self, audio_bytes: bytes, text: str, label: str, my_gen: int) -> bool:
+        """Inject audio + interruptible playback wait. Returns False if interrupted."""
+        if self._interrupt_event.is_set() or my_gen != self._generation:
+            return False
+
         try:
-            t_tts = time.time()
-            audio = await self._tts(text)
-            print(f"[{ts()}] ⏱ TTS {label}: {elapsed(t_tts)}")
-
-            if self._interrupt_event.is_set() or (my_gen >= 0 and my_gen != self._generation):
-                return False
-
             t_inj = time.time()
-            b64 = base64.b64encode(audio).decode("utf-8")
+            b64 = base64.b64encode(audio_bytes).decode("utf-8")
             await self.speaker._inject_into_meeting(b64)
             self._audio_playing = True
             print(f"[{ts()}] ⏱ Inject {label}: {elapsed(t_inj)}")
@@ -262,13 +288,32 @@ class WebSocketServer:
             self._audio_playing = False
             return True
         except Exception as e:
-            print(f"[{ts()}] ⚠️  TTS/inject failed ({label}): {e}")
-            return True  # continue, don't treat as interrupt
+            print(f"[{ts()}] ⚠️  Inject failed ({label}): {e}")
+            self._audio_playing = False
+            return True
+
+    async def _speak_simple(self, text, t0):
+        """Simple TTS + inject for greetings etc."""
+        if self._speaking:
+            return
+        self._speaking = True
+        try:
+            audio = await self._tts(text)
+            await self._inject_and_wait(audio, text, "greeting", self._generation)
+        except Exception as e:
+            print(f"[{ts()}] ⚠️  _speak_simple error: {e}")
+        finally:
+            self._speaking = False
+            self._audio_playing = False
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Background search + TTS preparation
+    # ══════════════════════════════════════════════════════════════════════════
 
     async def _search_and_prepare_audio(self, user_text: str, context: str) -> list[tuple[str, bytes]]:
         """Background: search → summarize → TTS all sentences. Returns ready-to-inject audio."""
         summary = await self.agent.search_and_summarize(user_text, context)
-        prefix = "Oh, and about your earlier question."
+        prefix = "Oh and about your earlier question."
         full = f"{prefix} {summary}"
 
         sentences = self.agent._split_sentences(full)
@@ -277,14 +322,13 @@ class WebSocketServer:
             try:
                 audio = await self._tts(sent)
                 prepared.append((sent, audio))
-                print(f"[{ts()}] 🔧 Pre-baked TTS: \"{sent[:40]}...\"")
+                print(f"[{ts()}] 🔧 Pre-baked TTS: \"{sent[:50]}\"")
             except Exception as e:
                 print(f"[{ts()}] ⚠️  Pre-bake TTS failed: {e}")
-
         return prepared
 
-    async def _deliver_pending(self, t0, my_gen: int):
-        """Deliver all pending search results — audio already pre-baked, just inject."""
+    async def _deliver_pending(self, my_gen: int):
+        """Deliver all pending search results — audio pre-baked, just inject."""
         while self._pending_searches:
             if self._interrupt_event.is_set() or my_gen != self._generation:
                 return
@@ -298,7 +342,7 @@ class WebSocketServer:
                 else:
                     prepared = prepare_task.result()
             except Exception as e:
-                print(f"[{ts()}] ⚠️  Pending prepare failed: {e}")
+                print(f"[{ts()}] ⚠️  Pending failed: {e}")
                 continue
 
             if not prepared:
@@ -306,27 +350,9 @@ class WebSocketServer:
 
             full_text = " ".join(sent for sent, _ in prepared)
             for i, (sent, audio_bytes) in enumerate(prepared):
-                if self._interrupt_event.is_set() or my_gen != self._generation:
+                ok = await self._inject_and_wait(audio_bytes, sent, f"pending-{i+1}", my_gen)
+                if not ok:
                     return
-
-                # Audio already ready — just inject + wait for playback
-                try:
-                    t_inj = time.time()
-                    b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                    await self.speaker._inject_into_meeting(b64)
-                    self._audio_playing = True
-                    print(f"[{ts()}] ⏱ Inject pending-{i+1}: {elapsed(t_inj)} (pre-baked)")
-
-                    play_dur = max(300, len(sent.split()) * 280)
-                    try:
-                        await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur / 1000)
-                        self._audio_playing = False
-                        return
-                    except asyncio.TimeoutError:
-                        pass
-                    self._audio_playing = False
-                except Exception as e:
-                    print(f"[{ts()}] ⚠️  Pending inject failed: {e}")
 
             self._log_sam(full_text)
             self.trigger.mark_responded()
@@ -346,16 +372,15 @@ class WebSocketServer:
         my_gen = generation
 
         try:
-            t_ctx = time.time()
             context = "\n".join(self._convo_history)
-            memory  = [e["text"] for e in self.agent.rag._entries[-20:]]
-            print(f"[{ts()}] ⏱ Context build: {elapsed(t_ctx)}")
-
             t1 = time.time()
 
-            # Fire trigger + router in parallel
+            # ── Trigger + Router in parallel ─────────────────────────────
             trigger_task = asyncio.create_task(
-                self.trigger.should_respond(text, speaker, context, memory)
+                self.trigger.should_respond(
+                    text, speaker, context,
+                    [e["text"] for e in self.agent.rag._entries[-20:]]
+                )
             )
             router_task = asyncio.create_task(self.agent._route(text))
 
@@ -370,9 +395,11 @@ class WebSocketServer:
             route = await router_task
             print(f"[{ts()}] Route: [{route}]")
 
-            # ── [FT] PATH — filler + background search + TTS ────────────
+            # ══════════════════════════════════════════════════════════════
+            # [FT] PATH — filler + background search + TTS
+            # ══════════════════════════════════════════════════════════════
             if route == "FT":
-                # 1. Fire search + TTS preparation in background immediately
+                # 1. Fire search + TTS in background immediately
                 prepare_task = asyncio.create_task(
                     self._search_and_prepare_audio(text, context)
                 )
@@ -381,68 +408,61 @@ class WebSocketServer:
                 # 2. Play filler
                 filler = random.choice(FILLERS)
                 print(f"[{ts()}] 🗣️ Filler: \"{filler}\"")
-                ok = await self._inject_sentence(filler, t0, "filler", my_gen)
+                try:
+                    filler_audio = await self._tts(filler)
+                except Exception as e:
+                    print(f"[{ts()}] ⚠️  Filler TTS failed: {e}")
+                    # Wait for search directly
+                    filler_audio = None
 
-                if not ok:
-                    # Interrupted during filler — search + TTS keeps running in background
-                    self._pending_searches.append((text, prepare_task))
-                    self._searching = False
-                    print(f"[{ts()}] 📥 Search saved to pending (search + TTS continues in background)")
-                    return
+                if filler_audio:
+                    ok = await self._inject_and_wait(filler_audio, filler, "filler", my_gen)
+                    if not ok:
+                        # Interrupted during filler — save search for later
+                        self._pending_searches.append((text, prepare_task))
+                        print(f"[{ts()}] 📥 Search saved to pending")
+                        return
 
-                # 3. Wait for search + TTS to complete
+                # 3. Wait for search + TTS
                 try:
                     prepared = await asyncio.wait_for(prepare_task, timeout=15)
-                    self._searching = False
                 except asyncio.TimeoutError:
-                    self._searching = False
-                    await self._inject_sentence("Hmm, that search is taking too long.", t0, "timeout", my_gen)
+                    try:
+                        await self._inject_and_wait(
+                            await self._tts("Hmm that search is taking too long."),
+                            "Hmm that search is taking too long.", "timeout", my_gen
+                        )
+                    except Exception:
+                        pass
                     return
                 except asyncio.CancelledError:
-                    self._searching = False
                     return
 
                 if self._interrupt_event.is_set() or my_gen != self._generation:
-                    # Interrupted after ready — save pre-baked audio for later
+                    # Interrupted after ready — save for later
                     fut = asyncio.get_event_loop().create_future()
                     fut.set_result(prepared)
                     self._pending_searches.append((text, fut))
+                    print(f"[{ts()}] 📥 Search ready but interrupted — saved to pending")
                     return
 
                 if not prepared:
                     return
 
-                # 4. Inject pre-baked audio — no TTS wait
+                # 4. Inject pre-baked audio (0ms TTS wait)
                 full_text = " ".join(sent for sent, _ in prepared)
-                all_ok = True
                 for i, (sent, audio_bytes) in enumerate(prepared):
-                    if self._interrupt_event.is_set() or my_gen != self._generation:
-                        all_ok = False
+                    ok = await self._inject_and_wait(audio_bytes, sent, f"search-{i+1}", my_gen)
+                    if not ok:
                         break
-
-                    t_inj = time.time()
-                    b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                    await self.speaker._inject_into_meeting(b64)
-                    self._audio_playing = True
-                    print(f"[{ts()}] ⏱ Inject search-{i+1}: {elapsed(t_inj)} (pre-baked)")
-
-                    play_dur = max(300, len(sent.split()) * 280)
-                    try:
-                        await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur / 1000)
-                        all_ok = False
-                        self._audio_playing = False
-                        break
-                    except asyncio.TimeoutError:
-                        pass
-                    self._audio_playing = False
 
                 self._log_sam(full_text)
                 self.trigger.mark_responded()
-                if all_ok:
-                    print(f"[{ts()}] 📊 TOTAL: {elapsed(t0)}")
-                    print(f"[{ts()}] ✅ Done (search, 0ms TTS at inject)")
+                print(f"[{ts()}] ✅ Done (search)")
 
-            # ── [PM] PATH — stream PM response ──────────────────────────
+            # ══════════════════════════════════════════════════════════════
+            # [PM] PATH — stream LLM + sentence TTS + inject each ASAP
+            # ══════════════════════════════════════════════════════════════
             else:
                 sentence_queue = asyncio.Queue()
                 llm_task = asyncio.create_task(
@@ -455,8 +475,8 @@ class WebSocketServer:
                 while True:
                     if self._interrupt_event.is_set() or my_gen != self._generation:
                         llm_task.cancel()
-                        for _, t in pending_tts:
-                            t.cancel()
+                        for _, t_task in pending_tts:
+                            t_task.cancel()
                         return
 
                     try:
@@ -480,67 +500,38 @@ class WebSocketServer:
                     if idx == 1:
                         sent, task = pending_tts.pop(0)
                         try:
-                            t_tts = time.time()
                             audio_bytes = await task
-                            print(f"[{ts()}] ⏱ TTS sentence 1: {elapsed(t_tts)}")
+                            print(f"[{ts()}] ⏱ TTS sentence 1: {elapsed(t1)}")
 
-                            if self._interrupt_event.is_set() or my_gen != self._generation:
-                                return
-
-                            t_inj = time.time()
-                            b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                            await self.speaker._inject_into_meeting(b64)
-                            self._audio_playing = True
-                            print(f"[{ts()}] ⏱ Inject sentence 1: {elapsed(t_inj)}")
-                            print(f"[{ts()}] 📊 FIRST AUDIO: {elapsed(t0)}")
-
-                            play_dur = max(300, len(sent.split()) * 280)
-                            try:
-                                await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur / 1000)
+                            ok = await self._inject_and_wait(audio_bytes, sent, "sentence-1", my_gen)
+                            if ok:
+                                print(f"[{ts()}] 📊 FIRST AUDIO: {elapsed(t0)}")
+                            else:
                                 self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
                                 self.trigger.mark_responded()
                                 llm_task.cancel()
-                                for _, t in pending_tts:
-                                    t.cancel()
+                                for _, t_task in pending_tts:
+                                    t_task.cancel()
                                 return
-                            except asyncio.TimeoutError:
-                                pass
-                            self._audio_playing = False
                         except Exception as e:
                             print(f"[{ts()}] ⚠️  TTS sentence 1 failed: {e}")
 
-                # Inject remaining sentences
+                # Inject remaining (TTS already done from prefetch)
                 for i, (sent, task) in enumerate(pending_tts):
                     if self._interrupt_event.is_set() or my_gen != self._generation:
-                        for _, t in pending_tts[i:]:
-                            t.cancel()
+                        for _, t_task in pending_tts[i:]:
+                            t_task.cancel()
                         return
 
                     try:
-                        t_tts = time.time()
                         audio_bytes = await task
-                        print(f"[{ts()}] ⏱ TTS sentence {i+2}: {elapsed(t_tts)}")
-
-                        if self._interrupt_event.is_set() or my_gen != self._generation:
-                            return
-
-                        t_inj = time.time()
-                        b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                        await self.speaker._inject_into_meeting(b64)
-                        self._audio_playing = True
-                        print(f"[{ts()}] ⏱ Inject sentence {i+2}: {elapsed(t_inj)}")
-
-                        play_dur = max(300, len(sent.split()) * 280)
-                        try:
-                            await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur / 1000)
+                        ok = await self._inject_and_wait(audio_bytes, sent, f"sentence-{i+2}", my_gen)
+                        if not ok:
                             self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
                             self.trigger.mark_responded()
-                            for _, t in pending_tts[i+1:]:
-                                t.cancel()
+                            for _, t_task in pending_tts[i+1:]:
+                                t_task.cancel()
                             return
-                        except asyncio.TimeoutError:
-                            pass
-                        self._audio_playing = False
                     except Exception as e:
                         print(f"[{ts()}] ⚠️  TTS sentence {i+2} failed: {e}")
 
@@ -551,7 +542,7 @@ class WebSocketServer:
                     print(f"[{ts()}] ✅ Done (PM)")
 
             # ── Deliver any pending search results ───────────────────────
-            await self._deliver_pending(t0, my_gen)
+            await self._deliver_pending(my_gen)
 
         except asyncio.CancelledError:
             print(f"[{ts()}] 🔄 Task cancelled")
@@ -564,31 +555,12 @@ class WebSocketServer:
             self._speaking      = False
             self._searching     = False
 
-    async def _speak_response(self, text, t0):
-        if self._speaking:
-            return
-        self._speaking = True
-        try:
-            voice_bytes = await self._tts(text)
-            b64 = base64.b64encode(voice_bytes).decode("utf-8")
-            await self.speaker._inject_into_meeting(b64)
-            self._interrupt_event.clear()
-            try:
-                await asyncio.wait_for(
-                    self._interrupt_event.wait(),
-                    timeout=len(text.split()) / WORDS_PER_SECOND
-                )
-            except asyncio.TimeoutError:
-                pass
-        except Exception as e:
-            print(f"[{ts()}] ⚠️  _speak_response error: {e}")
-        finally:
-            self._speaking = False
+    # ══════════════════════════════════════════════════════════════════════════
+    # Server start
+    # ══════════════════════════════════════════════════════════════════════════
 
     async def start(self):
-        # Start RAG background embedder + Groq warmup
         self.agent.start()
-        # Warm up Cartesia connection + validate keys
         await self.speaker.warmup()
 
         runner = web.AppRunner(self.app)
