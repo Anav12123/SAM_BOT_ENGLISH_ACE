@@ -32,6 +32,8 @@ class SileroVAD:
         self.speech_start = 0.0
         self.silence_start = 0.0
         self.last_confidence = 0.0
+        self.heard_speech = False      # True if VAD detected ANY speech since last flush
+        self.last_speech_time = 0.0    # When VAD last saw speech (any conf above threshold)
 
     async def setup(self):
         """Download ONNX model + initialize session. Call once at startup."""
@@ -125,23 +127,34 @@ class SileroVAD:
         now = time.time()
 
         if confidence >= threshold:
+            # Speech detected — mark it
+            self.heard_speech = True
+            self.last_speech_time = now
+            self.silence_start = 0.0
             if not self.is_speaking:
                 self.is_speaking = True
                 self.speech_start = now
-                print(f"[VAD] 🎙️ Speech started (conf={confidence:.2f})")
-            self.silence_start = 0.0
+                print(f"[VAD] 🎙️ Speech detected (conf={confidence:.2f})")
         else:
-            if self.is_speaking and self.silence_start == 0.0:
+            # Below threshold — track silence
+            if self.heard_speech and self.silence_start == 0.0:
                 self.silence_start = now
-            # Auto-reset if silence exceeds 3s — stale speech detection
-            elif self.is_speaking and self.silence_start > 0.0:
+            # Reset is_speaking after 3s of silence (but keep heard_speech!)
+            if self.is_speaking and self.silence_start > 0.0:
                 if (now - self.silence_start) > 3.0:
                     self.is_speaking = False
-                    self.silence_start = 0.0
+
+    def silence_since_last_speech_ms(self) -> float:
+        """Milliseconds since VAD last detected speech. 0 if no speech heard or still speaking."""
+        if not self.heard_speech or self.last_speech_time == 0.0:
+            return 0.0
+        if self.silence_start == 0.0:
+            return 0.0  # still detecting speech
+        return (time.time() - self.last_speech_time) * 1000
 
     def silence_duration_ms(self) -> float:
-        """Milliseconds of continuous silence. 0 if still speaking or no silence yet."""
-        if not self.is_speaking or self.silence_start == 0.0:
+        """Milliseconds of continuous silence. 0 if no silence started."""
+        if not self.heard_speech or self.silence_start == 0.0:
             return 0.0
         return (time.time() - self.silence_start) * 1000
 
@@ -150,6 +163,8 @@ class SileroVAD:
         self.is_speaking = False
         self.silence_start = 0.0
         self.speech_start = 0.0
+        self.heard_speech = False
+        self.last_speech_time = 0.0
 
     def reset(self):
         """Full reset — call between meetings."""
