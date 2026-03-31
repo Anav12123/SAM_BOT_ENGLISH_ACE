@@ -210,6 +210,8 @@ import os
 import base64
 import asyncio
 import httpx
+import aiohttp
+import json
 import io
 import hashlib
 import platform
@@ -261,6 +263,8 @@ RECALL_API_BASE = f"https://{RECALL_REGION}.recall.ai/api/v1"
 
 
 class CartesiaSpeaker:
+    VOICE_ID = "79a125e8-cd45-4c13-8a67-188112f4dd22"
+
     def __init__(self, bot_id: str = None):
         import Speaker as _self_module
         print(f"[Speaker] Loaded from: {_self_module.__file__}")
@@ -281,11 +285,9 @@ class CartesiaSpeaker:
             print(f"[Speaker] Noise load failed (not critical): {e}")
 
         self._base_noise = self._noise_slices if self._noise_slices else None
-        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
 
         # ── Multi-key Cartesia setup ─────────────────────────────────────
         self._cartesia_keys = []
-        # Collect all CARTESIA keys from env
         for key_name in ["CARTESIA_API_KEY", "CARTESIA_API_KEY_2", "CARTESIA_API_KEY_3", "CARTESIA_API_KEY_4", "CARTESIA_API_KEY_5"]:
             val = os.environ.get(key_name, "").strip()
             if val:
@@ -297,9 +299,13 @@ class CartesiaSpeaker:
         print(f"[Speaker] {len(self._cartesia_keys)} Cartesia key(s) loaded")
         self._key_index = 0
 
-        # One shared client — headers swapped per request
-        self._cartesia_client = httpx.AsyncClient(timeout=30, limits=limits)
+        # WebSocket connections — one per key, persistent for entire meeting
+        self._ws_connections: dict[str, aiohttp.ClientWebSocketResponse] = {}
+        self._ws_locks: dict[str, asyncio.Lock] = {}
+        self._ws_session: aiohttp.ClientSession | None = None
 
+        # Recall.ai client
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         self._recall_client  = httpx.AsyncClient(timeout=30, limits=limits)
         self._recall_headers = {
             "Authorization": f"Token {self.recall_key}",
@@ -307,73 +313,140 @@ class CartesiaSpeaker:
             "accept":        "application/json",
         }
 
+    async def _connect_ws(self, key: str) -> aiohttp.ClientWebSocketResponse | None:
+        """Open a persistent WebSocket to Cartesia for one key."""
+        try:
+            url = f"wss://api.cartesia.ai/tts/websocket?api_key={key}&cartesia_version=2025-04-16"
+            ws = await self._ws_session.ws_connect(url, heartbeat=30)
+            return ws
+        except Exception as e:
+            print(f"[Speaker] WS connect failed: {e}")
+            return None
+
     async def warmup(self):
-        """Pre-establish TCP to Cartesia + validate all keys. Call once after event loop starts."""
+        """Validate keys + open persistent WebSocket per valid key."""
+        import aiohttp as _aio
+        self._ws_session = _aio.ClientSession()
+
         valid_keys = []
         for i, key in enumerate(self._cartesia_keys):
-            try:
-                headers = {
-                    "Authorization": f"Bearer {key}",
-                    "Cartesia-Version": "2025-04-16",
-                    "Content-Type": "application/json",
-                }
-                response = await self._cartesia_client.post(
-                    "https://api.cartesia.ai/tts/bytes",
-                    headers=headers,
-                    json={
+            ws = await self._connect_ws(key)
+            if ws and not ws.closed:
+                # Test with a tiny TTS request
+                try:
+                    import uuid
+                    ctx = str(uuid.uuid4())
+                    await ws.send_json({
                         "model_id": "sonic-turbo",
                         "transcript": "hi",
-                        "voice": {"mode": "id", "id": "79a125e8-cd45-4c13-8a67-188112f4dd22"},
-                        "language": "en",
-                        "output_format": {"container": "mp3", "sample_rate": 44100, "bit_rate": 128000},
-                    },
-                )
-                if response.status_code in (200, 201):
+                        "voice": {"mode": "id", "id": self.VOICE_ID},
+                        "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
+                        "context_id": ctx,
+                    })
+                    # Read until done
+                    while True:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                        if msg.type == _aio.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("done", False):
+                                break
+                        else:
+                            break
+
                     valid_keys.append(key)
-                    print(f"[Speaker] ✅ Cartesia key #{i+1} valid")
-                else:
-                    print(f"[Speaker] ❌ Cartesia key #{i+1} invalid ({response.status_code})")
-            except Exception as e:
-                print(f"[Speaker] ❌ Cartesia key #{i+1} failed: {e}")
+                    self._ws_connections[key] = ws
+                    self._ws_locks[key] = asyncio.Lock()
+                    print(f"[Speaker] ✅ Cartesia key #{i+1} valid (WS open)")
+                except Exception as e:
+                    print(f"[Speaker] ❌ Cartesia key #{i+1} test failed: {e}")
+                    await ws.close()
+            else:
+                print(f"[Speaker] ❌ Cartesia key #{i+1} connect failed")
 
         if valid_keys:
             self._cartesia_keys = valid_keys
-            print(f"[Speaker] ✅ {len(valid_keys)} valid key(s), Cartesia warmed up")
+            print(f"[Speaker] ✅ {len(valid_keys)} key(s), WebSocket connections open")
         else:
             print(f"[Speaker] ⚠️  No valid Cartesia keys!")
 
-    def _next_cartesia_headers(self) -> dict:
-        """Round-robin key rotation — each TTS call uses a different key."""
+    def _next_key(self) -> str:
         key = self._cartesia_keys[self._key_index % len(self._cartesia_keys)]
         self._key_index += 1
-        return {
-            "Authorization":    f"Bearer {key}",
-            "Cartesia-Version": "2025-04-16",
-            "Content-Type":     "application/json",
-        }
+        return key
 
-    # ── ACTIVE: Cartesia Sonic-turbo TTS with key rotation ───────────────
+    async def _ensure_ws(self, key: str) -> aiohttp.ClientWebSocketResponse | None:
+        """Reconnect if WebSocket dropped."""
+        ws = self._ws_connections.get(key)
+        if ws and not ws.closed:
+            return ws
+        print(f"[Speaker] Reconnecting WS...")
+        ws = await self._connect_ws(key)
+        if ws:
+            self._ws_connections[key] = ws
+        return ws
+
+    # ── Cartesia WebSocket TTS — persistent connection ───────────────────
     async def _synthesise(self, text: str) -> bytes:
-        headers = self._next_cartesia_headers()
+        import uuid, json as _json
+
+        key = self._next_key()
         key_num = (self._key_index - 1) % len(self._cartesia_keys) + 1
-        print(f"[Speaker] TTS via Cartesia (key #{key_num})...")
-        response = await self._cartesia_client.post(
-            "https://api.cartesia.ai/tts/bytes",
-            headers=headers,
-            json={
-                "model_id":   "sonic-turbo",
+        lock = self._ws_locks.get(key)
+        if not lock:
+            lock = asyncio.Lock()
+            self._ws_locks[key] = lock
+
+        async with lock:
+            ws = await self._ensure_ws(key)
+            if not ws:
+                raise ConnectionError(f"Cartesia WS unavailable (key #{key_num})")
+
+            context_id = str(uuid.uuid4())
+            print(f"[Speaker] TTS via Cartesia WS (key #{key_num})...")
+
+            await ws.send_json({
+                "model_id": "sonic-turbo",
                 "transcript": text,
-                "voice":      {"mode": "id", "id": "79a125e8-cd45-4c13-8a67-188112f4dd22"},
-                "language":   "en",
-                "output_format": {
-                    "container":   "mp3",
-                    "sample_rate": 44100,
-                    "bit_rate":    128000,
-                },
-            },
-        )
-        response.raise_for_status()
-        return response.content
+                "voice": {"mode": "id", "id": self.VOICE_ID},
+                "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
+                "context_id": context_id,
+            })
+
+            # Collect audio chunks
+            audio_chunks = []
+            while True:
+                try:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=15)
+                except asyncio.TimeoutError:
+                    print(f"[Speaker] WS receive timeout")
+                    break
+
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = _json.loads(msg.data)
+                    if data.get("data"):
+                        audio_chunks.append(base64.b64decode(data["data"]))
+                    if data.get("done", False):
+                        break
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                    print(f"[Speaker] WS closed during TTS")
+                    # Remove so it reconnects next time
+                    self._ws_connections.pop(key, None)
+                    break
+
+            if not audio_chunks:
+                raise RuntimeError("No audio received from Cartesia WS")
+
+            # Convert raw PCM (s16le, 24kHz, mono) → MP3
+            raw_audio = b"".join(audio_chunks)
+            audio_seg = AudioSegment(
+                data=raw_audio,
+                sample_width=2,       # 16-bit = 2 bytes
+                frame_rate=24000,
+                channels=1,
+            )
+            mp3_buf = io.BytesIO()
+            audio_seg.export(mp3_buf, format="mp3", bitrate="64k")
+            return mp3_buf.getvalue()
 
     async def _inject_into_meeting(self, b64_audio: str):
         if not self.bot_id:
@@ -405,7 +478,10 @@ class CartesiaSpeaker:
             print(f"[Speaker] Stop audio error: {e}")
 
     async def close(self):
-        await asyncio.gather(
-            self._cartesia_client.aclose(),
-            self._recall_client.aclose(),
-        )
+        # Close all WebSocket connections
+        for key, ws in self._ws_connections.items():
+            if ws and not ws.closed:
+                await ws.close()
+        if self._ws_session:
+            await self._ws_session.close()
+        await self._recall_client.aclose()
