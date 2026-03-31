@@ -233,8 +233,11 @@ class WebSocketServer:
         my_gen = generation
 
         try:
+            t_ctx = time.time()
             context = "\n".join(self._convo_history)
             memory  = [e["text"] for e in self.agent.rag._entries[-20:]]
+            print(f"[{ts()}] ⏱ Context build: {elapsed(t_ctx)}")
+
             t1 = time.time()
 
             # Fire trigger + LLM in parallel
@@ -268,7 +271,11 @@ class WebSocketServer:
                     return
 
                 try:
+                    t_q = time.time()
                     item = await asyncio.wait_for(sentence_queue.get(), timeout=15.0)
+                    wait_ms = (time.time() - t_q) * 1000
+                    if item and item != "__FLUSH__" and item is not None:
+                        print(f"[{ts()}] ⏱ Queue wait: {wait_ms:.0f}ms")
                 except asyncio.TimeoutError:
                     print(f"[{ts()}] ⚠️  LLM queue timeout")
                     break
@@ -280,7 +287,9 @@ class WebSocketServer:
                 if item == "__FLUSH__":
                     if sentences and tts_tasks:
                         print(f"[{ts()}] 🗣️ Flushing filler audio...")
+                        t_flush = time.time()
                         flush_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+                        print(f"[{ts()}] ⏱ Filler TTS: {elapsed(t_flush)}")
                         chunks = [r for r in flush_results if not isinstance(r, Exception)]
                         if chunks:
                             filler_audio = b"".join(chunks)
@@ -315,7 +324,9 @@ class WebSocketServer:
                 sentences.append(item)
                 idx = len(all_sentences) + len(sentences)
                 print(f"[{ts()}] LLM sentence {idx} ({elapsed(t1)}): \"{item}\"")
+                t_tts_start = time.time()
                 tts_tasks.append(asyncio.create_task(self._tts(item)))
+                print(f"[{ts()}] ⏱ TTS task {idx} fired: {elapsed(t_tts_start)}")
 
             if not sentences and not tts_tasks:
                 if all_sentences:
@@ -327,9 +338,15 @@ class WebSocketServer:
 
             # Await TTS
             t2 = time.time()
-            print(f"[{ts()}] TTS ({len(sentences)} sentences, parallel+streamed)...")
+            print(f"[{ts()}] ⏱ Waiting for {len(tts_tasks)} TTS tasks...")
             results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+            tts_ms = (time.time() - t2) * 1000
+            print(f"[{ts()}] ⏱ TTS gather done: {tts_ms:.0f}ms")
+
             audio_chunks = [r for r in results if not isinstance(r, Exception)]
+            failed = sum(1 for r in results if isinstance(r, Exception))
+            if failed:
+                print(f"[{ts()}] ⚠️  {failed} TTS tasks failed")
 
             if not audio_chunks:
                 print(f"[{ts()}] ⚠️  All TTS failed")
@@ -338,9 +355,8 @@ class WebSocketServer:
             if self._interrupt_event.is_set() or my_gen != self._generation:
                 return
 
-            tts_ms = (time.time() - t2) * 1000
-
             # Concat + inject
+            t_enc = time.time()
             audio_bytes  = b"".join(audio_chunks)
             full_resp    = " ".join(all_sentences)
             word_count   = sum(len(s.split()) for s in sentences)
@@ -350,6 +366,7 @@ class WebSocketServer:
             b64 = await loop.run_in_executor(
                 None, lambda ab=audio_bytes: base64.b64encode(ab).decode("utf-8")
             )
+            print(f"[{ts()}] ⏱ Encode: {elapsed(t_enc)}")
 
             if self._interrupt_event.is_set() or my_gen != self._generation:
                 return
@@ -358,7 +375,8 @@ class WebSocketServer:
             await self.speaker._inject_into_meeting(b64)
             self._audio_playing = True
             inject_ms = (time.time() - t3) * 1000
-            print(f"[{ts()}] TTS {tts_ms:.0f}ms | Inject {inject_ms:.0f}ms | Lock {audio_dur_ms/1000:.1f}s | TOTAL {elapsed(t0)}")
+            print(f"[{ts()}] ⏱ Inject: {inject_ms:.0f}ms")
+            print(f"[{ts()}] 📊 BREAKDOWN: RAG+LLM {elapsed(t1)} | TTS {tts_ms:.0f}ms | Inject {inject_ms:.0f}ms | TOTAL {elapsed(t0)}")
 
             # Interruptible wait
             already = (time.time() - t2) * 1000
