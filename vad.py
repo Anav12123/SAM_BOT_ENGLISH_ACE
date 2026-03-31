@@ -73,7 +73,7 @@ class SileroVAD:
 
     # Recall.ai mixed audio is much quieter than direct microphone
     # Amplify before feeding to Silero which was trained on direct mic input
-    AUDIO_GAIN = 40.0
+    AUDIO_GAIN = 100.0
 
     def _reset_state(self):
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
