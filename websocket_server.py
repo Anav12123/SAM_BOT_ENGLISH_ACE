@@ -160,8 +160,10 @@ class WebSocketServer:
             # ── Different speaker interrupts Sam ──────────────────────
             if self._speaking and self._current_speaker != speaker:
                 print(f"[{ts()}] ⚡ INTERRUPT — {speaker} cut in")
-                asyncio.create_task(self.speaker.stop_audio())
+                if self._audio_playing:
+                    await self.speaker.stop_audio()
                 self._interrupt_event.set()
+                await asyncio.sleep(0.1)
                 self._buffer.clear()
                 self._buffer.append((speaker, text, t))
                 self._restart_debounce(speaker)
@@ -170,24 +172,24 @@ class WebSocketServer:
             # ── Same speaker adds more while Sam is speaking ──────────
             if self._speaking and self._current_speaker == speaker:
                 if self._searching:
-                    # During search, same speaker non-ack = new question → save search to pending
                     print(f"[{ts()}] 📥 New question during search — saving search to pending")
-                    # The prepare_task is inside _process — we'll handle this via interrupt
                     if self._current_task and not self._current_task.done():
                         self._current_task.cancel()
                     if self._audio_playing:
-                        asyncio.create_task(self.speaker.stop_audio())
+                        await self.speaker.stop_audio()
                     self._speaking = False
                     self._audio_playing = False
                     self._interrupt_event.set()
+                    await asyncio.sleep(0.1)  # brief gap to ensure Recall.ai stops old audio
                 else:
                     if self._current_task and not self._current_task.done():
                         self._current_task.cancel()
                     if self._audio_playing:
-                        asyncio.create_task(self.speaker.stop_audio())
+                        await self.speaker.stop_audio()
                     self._speaking = False
                     self._audio_playing = False
                     self._interrupt_event.set()
+                    await asyncio.sleep(0.1)  # brief gap
 
             # Buffer the fragment
             self._buffer.append((speaker, text, t))
@@ -207,7 +209,9 @@ class WebSocketServer:
             print(f"[{ts()}] 🎤 {speaker} started speaking")
             if self._speaking and self._current_speaker != speaker:
                 print(f"[{ts()}] ⚡ INTERRUPT (speech_on) — {speaker} cut in")
-                asyncio.create_task(self.speaker.stop_audio())
+                if self._audio_playing:
+                    await self.speaker.stop_audio()
+                    await asyncio.sleep(0.1)
                 self._interrupt_event.set()
 
         elif event == "participant_events.join":
