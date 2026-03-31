@@ -59,6 +59,13 @@ class SileroVAD:
                 providers=["CPUExecutionProvider"]
             )
             self._reset_state()
+
+            # Test inference to verify model works
+            test_audio = np.zeros(self.CHUNK_SAMPLES, dtype=np.float32)
+            test_conf = self._infer(test_audio)
+            self._reset_state()  # reset after test
+            print(f"[VAD] Test inference: conf={test_conf:.4f} (expected ~0 for silence)")
+
             self._ready = True
             print("[VAD] ✅ Silero VAD ready (ONNX, ~1ms/chunk)")
         except Exception as e:
@@ -95,13 +102,20 @@ class SileroVAD:
                 "input": chunk.reshape(1, -1),
                 "h": self._h,
                 "c": self._c,
-                "sr": np.array(self.SAMPLE_RATE, dtype=np.int64),
+                "sr": np.array([self.SAMPLE_RATE], dtype=np.int64),
             }
             ort_outs = self._session.run(None, ort_inputs)
             self._h = ort_outs[1]
             self._c = ort_outs[2]
             return float(ort_outs[0].item())
-        except Exception:
+        except Exception as e:
+            if not hasattr(self, '_infer_error_logged'):
+                print(f"[VAD] ⚠️  Inference error: {e}")
+                # Debug: print model input details
+                print(f"[VAD] Model inputs: {[i.name for i in self._session.get_inputs()]}")
+                print(f"[VAD] Model input shapes: {[(i.name, i.shape, i.type) for i in self._session.get_inputs()]}")
+                print(f"[VAD] Chunk shape: {chunk.shape}, dtype: {chunk.dtype}")
+                self._infer_error_logged = True
             return 0.0
 
     def update_state(self, confidence: float, threshold: float = 0.5):
