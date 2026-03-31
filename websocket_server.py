@@ -45,6 +45,7 @@ _ACK_PHRASES = frozenset({
     "right", "hmm", "mhm", "cool", "got it", "fine", "yep", "yup",
     "carry on", "go on", "continue", "waiting", "i'm waiting",
     "i am waiting", "no problem", "take your time", "np",
+    "hello", "hi", "hey", "huh", "what", "sorry",
 })
 
 # ── Fix Deepgram misrecognitions ─────────────────────────────────────────────
@@ -168,8 +169,18 @@ class WebSocketServer:
 
             # ── Same speaker adds more while Sam is speaking ──────────
             if self._speaking and self._current_speaker == speaker:
-                # Don't cancel if we're in search — search continues in background
-                if not self._searching:
+                if self._searching:
+                    # During search, same speaker non-ack = new question → save search to pending
+                    print(f"[{ts()}] 📥 New question during search — saving search to pending")
+                    # The prepare_task is inside _process — we'll handle this via interrupt
+                    if self._current_task and not self._current_task.done():
+                        self._current_task.cancel()
+                    if self._audio_playing:
+                        asyncio.create_task(self.speaker.stop_audio())
+                    self._speaking = False
+                    self._audio_playing = False
+                    self._interrupt_event.set()
+                else:
                     if self._current_task and not self._current_task.done():
                         self._current_task.cancel()
                     if self._audio_playing:
@@ -277,7 +288,7 @@ class WebSocketServer:
             self._audio_playing = True
             print(f"[{ts()}] ⏱ Inject {label}: {elapsed(t_inj)}")
 
-            play_dur = max(300, len(text.split()) * 280)
+            play_dur = max(500, len(text.split()) * 350 + 300)
             try:
                 await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur / 1000)
                 print(f"[{ts()}] ⚡ Interrupted during {label}")
@@ -313,10 +324,8 @@ class WebSocketServer:
     async def _search_and_prepare_audio(self, user_text: str, context: str) -> list[tuple[str, bytes]]:
         """Background: search → summarize → TTS all sentences. Returns ready-to-inject audio."""
         summary = await self.agent.search_and_summarize(user_text, context)
-        prefix = "Oh and about your earlier question."
-        full = f"{prefix} {summary}"
 
-        sentences = self.agent._split_sentences(full)
+        sentences = self.agent._split_sentences(summary)
         prepared = []
         for sent in sentences:
             try:
@@ -348,15 +357,25 @@ class WebSocketServer:
             if not prepared:
                 continue
 
+            # Add prefix ONLY for pending delivery — "Oh and about your earlier question"
+            prefix = "Oh and about your earlier question."
+            try:
+                prefix_audio = await self._tts(prefix)
+                ok = await self._inject_and_wait(prefix_audio, prefix, "pending-prefix", my_gen)
+                if not ok:
+                    return
+            except Exception:
+                pass
+
             full_text = " ".join(sent for sent, _ in prepared)
             for i, (sent, audio_bytes) in enumerate(prepared):
                 ok = await self._inject_and_wait(audio_bytes, sent, f"pending-{i+1}", my_gen)
                 if not ok:
                     return
 
-            self._log_sam(full_text)
+            self._log_sam(f"{prefix} {full_text}")
             self.trigger.mark_responded()
-            print(f"[{ts()}] ✅ Pending delivered (0ms TTS wait)")
+            print(f"[{ts()}] ✅ Pending delivered")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Main processing pipeline
@@ -374,6 +393,8 @@ class WebSocketServer:
         try:
             context = "\n".join(self._convo_history)
             t1 = time.time()
+            _active_prepare_task = None  # track for CancelledError cleanup
+            _active_search_text = text
 
             # ── Trigger + Router in parallel ─────────────────────────────
             trigger_task = asyncio.create_task(
@@ -403,6 +424,7 @@ class WebSocketServer:
                 prepare_task = asyncio.create_task(
                     self._search_and_prepare_audio(text, context)
                 )
+                _active_prepare_task = prepare_task
                 self._searching = True
 
                 # 2. Play filler
@@ -546,6 +568,20 @@ class WebSocketServer:
 
         except asyncio.CancelledError:
             print(f"[{ts()}] 🔄 Task cancelled")
+            # Save active search to pending so results aren't lost
+            if _active_prepare_task and not _active_prepare_task.done():
+                self._pending_searches.append((_active_search_text, _active_prepare_task))
+                print(f"[{ts()}] 📥 Active search saved to pending: \"{_active_search_text[:50]}\"")
+            elif _active_prepare_task and _active_prepare_task.done():
+                try:
+                    result = _active_prepare_task.result()
+                    if result:
+                        fut = asyncio.get_event_loop().create_future()
+                        fut.set_result(result)
+                        self._pending_searches.append((_active_search_text, fut))
+                        print(f"[{ts()}] 📥 Completed search saved to pending: \"{_active_search_text[:50]}\"")
+                except Exception:
+                    pass
         except Exception as e:
             import traceback
             print(f"[{ts()}] ❌ _process error: {e}")
