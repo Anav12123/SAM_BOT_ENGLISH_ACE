@@ -315,12 +315,12 @@ class WebSocketServer:
             # When VAD is active, debounce is just a safety net (5s)
             # VAD + speech_off handles real flush timing
             # Without VAD, flush after 1.0s of no new transcript (old behavior)
-            timeout = 5.0 if self._vad.ready else 1.0
+            timeout = 2.5 if self._vad.ready else 1.0
             await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
         if self._buffer and not self._speaking:
-            print(f"[{ts()}] ⏰ Debounce safety flush ({5.0 if self._vad.ready else 1.0}s)")
+            print(f"[{ts()}] ⏰ Debounce safety flush ({2.5 if self._vad.ready else 1.0}s)")
             self._flush_buffer()
 
     def _flush_buffer(self):
