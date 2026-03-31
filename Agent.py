@@ -254,10 +254,10 @@ FILLERS = [
 class PMAgent:
     def __init__(self):
         self.client = AsyncOpenAI(
-            api_key=os.environ["GEMINI_API_KEY"],
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
         )
-        self.model = "gemini-2.5-flash-lite"
+        self.model = "llama-3.1-8b-instant"  # ~150-250ms on Groq
 
         # Recent LLM history — last 10 turns
         self.history: list[dict] = []
