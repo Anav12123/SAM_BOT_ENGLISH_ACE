@@ -23,8 +23,7 @@ class SileroVAD:
 
     def __init__(self):
         self._session = None
-        self._h = None
-        self._c = None
+        self._state = None
         self._ready = False
         self._audio_buffer = np.array([], dtype=np.float32)
 
@@ -73,8 +72,7 @@ class SileroVAD:
             self._ready = False
 
     def _reset_state(self):
-        self._h = np.zeros((2, 1, 64), dtype=np.float32)
-        self._c = np.zeros((2, 1, 64), dtype=np.float32)
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._audio_buffer = np.array([], dtype=np.float32)
 
     def process_chunk(self, pcm_bytes: bytes) -> list[float]:
@@ -82,7 +80,6 @@ class SileroVAD:
         if not self._ready:
             return []
 
-        # S16LE → float32 normalized [-1, 1]
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         self._audio_buffer = np.concatenate([self._audio_buffer, samples])
 
@@ -100,21 +97,17 @@ class SileroVAD:
         try:
             ort_inputs = {
                 "input": chunk.reshape(1, -1),
-                "h": self._h,
-                "c": self._c,
-                "sr": np.array([self.SAMPLE_RATE], dtype=np.int64),
+                "state": self._state,
+                "sr": np.array(self.SAMPLE_RATE, dtype=np.int64),
             }
             ort_outs = self._session.run(None, ort_inputs)
-            self._h = ort_outs[1]
-            self._c = ort_outs[2]
+            self._state = ort_outs[1]
             return float(ort_outs[0].item())
         except Exception as e:
             if not hasattr(self, '_infer_error_logged'):
                 print(f"[VAD] ⚠️  Inference error: {e}")
-                # Debug: print model input details
                 print(f"[VAD] Model inputs: {[i.name for i in self._session.get_inputs()]}")
                 print(f"[VAD] Model input shapes: {[(i.name, i.shape, i.type) for i in self._session.get_inputs()]}")
-                print(f"[VAD] Chunk shape: {chunk.shape}, dtype: {chunk.dtype}")
                 self._infer_error_logged = True
             return 0.0
 
