@@ -243,8 +243,21 @@ class PMAgent:
         self.rag = MeetingRAG()
 
     def start(self):
-        """Call once after event loop is running to start background embedder."""
+        """Call once after event loop is running to start background embedder + warmup."""
         self.rag.start_background_embedder()
+        asyncio.create_task(self._warmup())
+
+    async def _warmup(self):
+        """Pre-establish TCP connection to Groq — saves ~300ms on first real call."""
+        try:
+            await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            print("[Agent] ✅ Groq connection warmed up")
+        except Exception:
+            pass
 
     def _get_web_search(self):
         if not hasattr(self, '_web_search') or self._web_search is None:
@@ -317,7 +330,7 @@ class PMAgent:
         if interrupted:
             return await self._llm_call(full_text, INTERRUPT_PROMPT, max_tokens=25)
 
-        response = await self._llm_call(full_text, UNIFIED_PROMPT, max_tokens=80)
+        response = await self._llm_call(full_text, UNIFIED_PROMPT, max_tokens=50)
 
         if not self._is_search_signal(response):
             return response
@@ -345,8 +358,8 @@ class PMAgent:
         print(f"[Agent] ⏱ RAG context: {rag_ms:.0f}ms")
 
         self.history.append({"role": "user", "content": full_text})
-        if len(self.history) > 6:
-            self.history = self.history[-6:]
+        if len(self.history) > 4:
+            self.history = self.history[-4:]
 
         # Count tokens being sent
         total_chars = len(UNIFIED_PROMPT) + sum(len(m["content"]) for m in self.history)
@@ -358,7 +371,7 @@ class PMAgent:
                 model=self.model,
                 messages=[{"role": "system", "content": UNIFIED_PROMPT}] + self.history,
                 temperature=0.7,
-                max_tokens=80,
+                max_tokens=50,
                 stream=True,
             )
             stream_open_ms = (_t.time() - t1) * 1000
@@ -483,8 +496,8 @@ class PMAgent:
 
     async def _llm_call(self, user_msg: str, system: str, max_tokens: int = 60) -> str:
         self.history.append({"role": "user", "content": user_msg})
-        if len(self.history) > 6:
-            self.history = self.history[-6:]
+        if len(self.history) > 4:
+            self.history = self.history[-4:]
 
         stream = await self.client.chat.completions.create(
             model=self.model,
