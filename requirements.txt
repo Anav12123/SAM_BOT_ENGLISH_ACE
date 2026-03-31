@@ -7,3 +7,5 @@ pydub
 unidecode
 fastembed
 numpy
+onnxruntime
+
