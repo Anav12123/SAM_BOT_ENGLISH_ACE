@@ -242,7 +242,7 @@ class WebSocketServer:
 
                 # Lower threshold for mixed meeting audio (Recall.ai audio is quieter)
                 for conf in confidences:
-                    self._vad.update_state(conf, threshold=0.15)
+                    self._vad.update_state(conf, threshold=0.08)
 
                 # Debug logging — track max confidence to calibrate threshold
                 if not hasattr(self, '_audio_event_count'):
