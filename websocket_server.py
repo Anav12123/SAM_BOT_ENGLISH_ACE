@@ -6,14 +6,11 @@ Pipeline:
     [PM] → LLM stream → sentence TTS → inject each ASAP
     [FT] → filler inject → background search+TTS → inject or save pending
 
-Edge cases handled:
-  - Ack detection during search ("Sure", "OK", "Go ahead") → ignored
-  - Pending search queue → delivers after current response
-  - No overlapping audio ever — sequential inject + playback wait
-  - Same speaker continuation → rebuffer
-  - Different speaker interrupt → stop audio + process new
-  - Filler playback tracked as _speaking/_audio_playing
-  - Graceful crash handling in finally blocks
+VAD integration (Silero via ONNX):
+  audio_mixed_raw.data → Silero VAD → speech/silence detection
+  - Filters coughs/noise (VAD confidence < 0.5)
+  - Smart turn detection: flush only when VAD confirms sustained silence
+  - Falls back to speech_off if VAD unavailable
 """
 
 import asyncio
@@ -29,6 +26,7 @@ from collections import deque
 from Trigger import TriggerDetector
 from Agent import PMAgent, FILLERS
 from Speaker import CartesiaSpeaker, _mix_noise
+from vad import SileroVAD
 
 
 def ts():
@@ -94,6 +92,14 @@ class WebSocketServer:
 
         # TTS rate limiter — matches number of Cartesia keys
         self._tts_semaphore = asyncio.Semaphore(4)
+
+        # VAD — Silero via ONNX for smart turn detection
+        self._vad = SileroVAD()
+        self._vad_flush_task: asyncio.Task | None = None
+        # VAD silence threshold (ms) before flushing buffer
+        self.VAD_SILENCE_MS = 700
+        # Minimum words before VAD can trigger flush
+        self.VAD_MIN_WORDS = 2
 
         self.app = web.Application()
         self.app.router.add_get("/ws",     self.handle_websocket)
@@ -195,24 +201,58 @@ class WebSocketServer:
             self._buffer.append((speaker, text, t))
             self._restart_debounce(speaker)
 
-        # ── Speech OFF → flush buffer ─────────────────────────────────────
+        # ── Speech OFF → flush only if VAD agrees or VAD unavailable ──
         elif event == "participant_events.speech_off":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
             print(f"[{ts()}] 🔇 {speaker} stopped speaking")
             if self._buffer_task and not self._buffer_task.done():
                 self._buffer_task.cancel()
-            if self._buffer and not self._speaking:
-                self._flush_buffer()
+
+            if self._vad.ready:
+                # VAD available — don't flush immediately, wait for VAD silence confirmation
+                # Start a VAD flush check that polls for sustained silence
+                if self._vad_flush_task and not self._vad_flush_task.done():
+                    self._vad_flush_task.cancel()
+                self._vad_flush_task = asyncio.create_task(self._vad_wait_then_flush())
+            else:
+                # No VAD — flush immediately (old behavior)
+                if self._buffer and not self._speaking:
+                    self._flush_buffer()
 
         elif event == "participant_events.speech_on":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
             print(f"[{ts()}] 🎤 {speaker} started speaking")
+            # Cancel any pending VAD flush — user is still talking
+            if self._vad_flush_task and not self._vad_flush_task.done():
+                self._vad_flush_task.cancel()
+                self._vad_flush_task = None
+
             if self._speaking and self._current_speaker != speaker:
                 print(f"[{ts()}] ⚡ INTERRUPT (speech_on) — {speaker} cut in")
                 if self._audio_playing:
                     await self.speaker.stop_audio()
                     await asyncio.sleep(0.1)
                 self._interrupt_event.set()
+
+        # ── Raw audio → Silero VAD ────────────────────────────────────────
+        elif event == "audio_mixed_raw.data":
+            if not self._vad.ready:
+                return
+            # Don't run VAD while bot is speaking (mixed audio includes bot's TTS)
+            if self._audio_playing:
+                return
+
+            audio_b64 = payload.get("data", {}).get("data", {}).get("buffer", "")
+            if not audio_b64:
+                return
+
+            try:
+                pcm_bytes = base64.b64decode(audio_b64)
+                confidences = self._vad.process_chunk(pcm_bytes)
+                for conf in confidences:
+                    self._vad.update_state(conf, threshold=0.5)
+            except Exception:
+                pass
 
         elif event == "participant_events.join":
             name = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
@@ -269,8 +309,58 @@ class WebSocketServer:
         t0        = self._buffer[0][2]
         full_text = " ".join(txt for _, txt, _ in self._buffer)
         self._buffer.clear()
+
+        # Cancel any pending VAD flush
+        if self._vad_flush_task and not self._vad_flush_task.done():
+            self._vad_flush_task.cancel()
+
+        # Reset VAD turn state
+        self._vad.end_turn()
+
         print(f"[{ts()}] 📝 Buffered complete: \"{full_text}\"")
         self._start_process(full_text, speaker, t0)
+
+    async def _vad_wait_then_flush(self):
+        """Wait for VAD to confirm sustained silence, then flush buffer.
+        Called after speech_off. Polls VAD state every 50ms."""
+        try:
+            # Give VAD a moment to process remaining audio chunks
+            await asyncio.sleep(0.1)
+
+            # Poll for sustained silence
+            max_wait = 3.0  # safety timeout — don't wait forever
+            start = time.time()
+            while time.time() - start < max_wait:
+                silence_ms = self._vad.silence_duration_ms()
+
+                if silence_ms >= self.VAD_SILENCE_MS:
+                    # VAD confirms sustained silence — flush
+                    word_count = sum(len(txt.split()) for _, txt, _ in self._buffer) if self._buffer else 0
+                    if self._buffer and not self._speaking and word_count >= self.VAD_MIN_WORDS:
+                        print(f"[{ts()}] 🎯 VAD confirmed silence ({silence_ms:.0f}ms) — flushing")
+                        self._flush_buffer()
+                        return
+                    elif self._buffer and not self._speaking:
+                        # Too few words — wait a bit more for continuation
+                        print(f"[{ts()}] 🎯 VAD silence but only {word_count} words — waiting")
+                        await asyncio.sleep(0.3)
+                        continue
+                    return
+
+                # VAD detected voice activity — user resumed speaking
+                if self._vad.is_speaking and self._vad.silence_start == 0.0:
+                    print(f"[{ts()}] 🎯 VAD: user resumed speaking — hold flush")
+                    return  # speech_off will fire again when they stop
+
+                await asyncio.sleep(0.05)  # 50ms poll interval
+
+            # Timeout — flush anyway as safety net
+            if self._buffer and not self._speaking:
+                print(f"[{ts()}] 🎯 VAD timeout ({max_wait}s) — flushing anyway")
+                self._flush_buffer()
+
+        except asyncio.CancelledError:
+            return  # speech_on fired — user resumed, flush cancelled
 
     # ══════════════════════════════════════════════════════════════════════════
     # TTS + inject helpers
@@ -602,6 +692,7 @@ class WebSocketServer:
     async def start(self):
         self.agent.start()
         await self.speaker.warmup()
+        await self._vad.setup()
 
         runner = web.AppRunner(self.app)
         await runner.setup()
