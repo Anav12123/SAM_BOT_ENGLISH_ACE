@@ -234,7 +234,7 @@ class PMAgent:
             api_key=os.environ["GROQ_API_KEY"],
             base_url="https://api.groq.com/openai/v1",
         )
-        self.model = "llama-3.1-8b-instant"  # ~150-250ms on Groq
+        self.model = "llama-3.3-70b-versatile"
 
         # Recent LLM history — last 10 turns
         self.history: list[dict] = []
