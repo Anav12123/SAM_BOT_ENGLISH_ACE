@@ -133,6 +133,11 @@ class SileroVAD:
         else:
             if self.is_speaking and self.silence_start == 0.0:
                 self.silence_start = now
+            # Auto-reset if silence exceeds 3s — stale speech detection
+            elif self.is_speaking and self.silence_start > 0.0:
+                if (now - self.silence_start) > 3.0:
+                    self.is_speaking = False
+                    self.silence_start = 0.0
 
     def silence_duration_ms(self) -> float:
         """Milliseconds of continuous silence. 0 if still speaking or no silence yet."""
