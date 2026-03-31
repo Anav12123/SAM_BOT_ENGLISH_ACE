@@ -233,8 +233,8 @@ INTERRUPT_PROMPT = """You are Sam, a witty senior PM. You were interrupted.
 Reply in ONE sentence — 15 words max. Be quick, natural.
 Start with: "Oh," / "Right," / "Sure," / "Got it," — then pivot to their question."""
 
-SEARCH_QUERY_PROMPT = """Convert the user's message into a short English Google search query (max 8 words).
-ONLY replace 'our company'/'my company' with 'AnavClouds' if the user refers to their own company.
+SEARCH_QUERY_PROMPT = """Convert the user's message into a short English Google search query (max 10 words).
+If the user says 'our company'/'my company'/'our'/'we', replace with 'AnavClouds Software Solutions'.
 Do NOT add AnavClouds if the user didn't mention the company.
 Output ONLY the search query. No quotes, no explanation."""
 
@@ -286,7 +286,7 @@ class PMAgent:
         parts = []
 
         # RAG search — finds semantically relevant past exchanges
-        rag_results = await self.rag.search(user_text, top_k=5)
+        rag_results = await self.rag.search(user_text, top_k=2)
         if rag_results:
             parts.append("Meeting memory (relevant past discussions):\n" + "\n".join(rag_results))
 
@@ -363,8 +363,8 @@ class PMAgent:
         full_text = await self._build_context(user_text, context)
 
         self.history.append({"role": "user", "content": full_text})
-        if len(self.history) > 10:
-            self.history = self.history[-10:]
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
 
         try:
             # Stream the response — push sentences to queue as they complete
@@ -483,8 +483,8 @@ class PMAgent:
 
     async def _llm_call(self, user_msg: str, system: str, max_tokens: int = 60) -> str:
         self.history.append({"role": "user", "content": user_msg})
-        if len(self.history) > 10:
-            self.history = self.history[-10:]
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
 
         stream = await self.client.chat.completions.create(
             model=self.model,
