@@ -85,6 +85,10 @@ class WebSocketServer:
         self._buffer:      list = []
         self._buffer_task: asyncio.Task | None = None
 
+        # Partial transcript — grows as user speaks, replaced by final
+        self._partial_text:    str = ""
+        self._partial_speaker: str = ""
+
         # Search state
         self._searching = False
         # Pending: list of (query_text, prepare_task) where prepare_task returns list[(sentence, audio_bytes)]
@@ -141,7 +145,7 @@ class WebSocketServer:
 
         event = payload.get("event", "")
 
-        # ── Transcript ────────────────────────────────────────────────────
+        # ── Transcript (final) ────────────────────────────────────────
         if event == "transcript.data":
             inner   = payload.get("data", {}).get("data", {})
             words   = inner.get("words", [])
@@ -152,6 +156,10 @@ class WebSocketServer:
 
             text = _fix_transcription(text)
             print(f"\n[{ts()}] [{speaker}] {text}  ⏱ {elapsed(t)}")
+
+            # Final replaces any partial for this speaker
+            self._partial_text = ""
+            self._partial_speaker = ""
 
             # Store in RAG immediately
             self.agent.log_exchange(speaker, text)
@@ -185,7 +193,7 @@ class WebSocketServer:
                     self._speaking = False
                     self._audio_playing = False
                     self._interrupt_event.set()
-                    await asyncio.sleep(0.1)  # brief gap to ensure Recall.ai stops old audio
+                    await asyncio.sleep(0.1)
                 else:
                     if self._current_task and not self._current_task.done():
                         self._current_task.cancel()
@@ -194,11 +202,25 @@ class WebSocketServer:
                     self._speaking = False
                     self._audio_playing = False
                     self._interrupt_event.set()
-                    await asyncio.sleep(0.1)  # brief gap
+                    await asyncio.sleep(0.1)
 
-            # Buffer the fragment
+            # Buffer the final fragment
             self._buffer.append((speaker, text, t))
             self._restart_debounce(speaker)
+
+        # ── Transcript (partial — low latency, updates as user speaks) ──
+        elif event == "transcript.partial_data":
+            inner   = payload.get("data", {}).get("data", {})
+            words   = inner.get("words", [])
+            text    = " ".join(w.get("text", "") for w in words).strip()
+            speaker = inner.get("participant", {}).get("name", "Unknown")
+            if not text or speaker.lower() == "sam":
+                return
+
+            text = _fix_transcription(text)
+            # Replace previous partial (partials grow: "Sam" → "Sam tell me" → "Sam tell me about")
+            self._partial_text = text
+            self._partial_speaker = speaker
 
         # ── Speech OFF → fallback flush if VAD didn't catch it ──────────
         elif event == "participant_events.speech_off":
@@ -225,19 +247,14 @@ class WebSocketServer:
                 self._interrupt_event.set()
 
         # ── Raw audio → Silero VAD → self-triggered flush ─────────────────
-        elif event == "audio_separate_raw.data":
+        elif event == "audio_mixed_raw.data":
             if not self._vad.ready:
                 return
-
-            inner = payload.get("data", {}).get("data", {})
-
-            # Skip bot's own audio
-            participant = inner.get("participant", {})
-            speaker_name = participant.get("name", "")
-            if speaker_name and speaker_name.lower() == "sam":
+            # Don't run VAD while bot is speaking (mixed audio includes bot's TTS)
+            if self._audio_playing:
                 return
 
-            audio_b64 = inner.get("buffer", "")
+            audio_b64 = payload.get("data", {}).get("data", {}).get("buffer", "")
             if not audio_b64:
                 return
 
@@ -246,9 +263,9 @@ class WebSocketServer:
                 confidences = self._vad.process_chunk(pcm_bytes)
 
                 for conf in confidences:
-                    self._vad.update_state(conf, threshold=0.08)
+                    self._vad.update_state(conf, threshold=0.05)
 
-                # Debug logging — track max confidence to calibrate threshold
+                # Debug logging
                 if not hasattr(self, '_audio_event_count'):
                     self._audio_event_count = 0
                     self._max_conf = 0.0
@@ -257,16 +274,18 @@ class WebSocketServer:
                     self._max_conf = max(self._max_conf, max(confidences))
 
                 if self._audio_event_count == 1:
-                    print(f"[{ts()}] 🔊 First audio_separate_raw from '{speaker_name}' ({len(pcm_bytes)} bytes)")
+                    print(f"[{ts()}] 🔊 First audio_mixed_raw received ({len(pcm_bytes)} bytes)")
                 elif self._audio_event_count % 100 == 0:
                     print(f"[{ts()}] 🔊 Audio#{self._audio_event_count} heard={self._vad.heard_speech} conf={self._vad.last_confidence:.3f} max={self._max_conf:.3f} silence={self._vad.silence_duration_ms():.0f}ms buf={len(self._buffer)}")
 
                 # ── VAD-triggered flush: heard speech + sustained silence → flush
-                if self._vad.heard_speech and self._buffer and not self._speaking:
+                has_text = bool(self._buffer) or bool(self._partial_text)
+                if self._vad.heard_speech and has_text and not self._speaking:
                     silence_ms = self._vad.silence_duration_ms()
                     word_count = sum(len(txt.split()) for _, txt, _ in self._buffer)
+                    word_count += len(self._partial_text.split()) if self._partial_text else 0
                     if silence_ms >= self.VAD_SILENCE_MS and word_count >= self.VAD_MIN_WORDS:
-                        print(f"[{ts()}] 🎯 VAD flush: {silence_ms:.0f}ms silence, {word_count} words buffered")
+                        print(f"[{ts()}] 🎯 VAD flush: {silence_ms:.0f}ms silence, {word_count} words (buf={len(self._buffer)} partial={len(self._partial_text.split()) if self._partial_text else 0})")
                         if self._buffer_task and not self._buffer_task.done():
                             self._buffer_task.cancel()
                         self._flush_buffer()
@@ -316,24 +335,38 @@ class WebSocketServer:
 
     async def _debounce_then_flush(self, speaker: str):
         try:
-            # When VAD is active, debounce is just a safety net (5s)
-            # VAD + speech_off handles real flush timing
-            # Without VAD, flush after 1.0s of no new transcript (old behavior)
             timeout = 2.5 if self._vad.ready else 1.0
             await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
-        if self._buffer and not self._speaking:
+        if (self._buffer or self._partial_text) and not self._speaking:
             print(f"[{ts()}] ⏰ Debounce safety flush ({2.5 if self._vad.ready else 1.0}s)")
             self._flush_buffer()
 
     def _flush_buffer(self):
-        if not self._buffer:
+        # Combine finalized buffer + any remaining partial
+        if not self._buffer and not self._partial_text:
             return
-        speaker   = self._buffer[-1][0]
-        t0        = self._buffer[0][2]
-        full_text = " ".join(txt for _, txt, _ in self._buffer)
+
+        if self._buffer:
+            speaker   = self._buffer[-1][0]
+            t0        = self._buffer[0][2]
+            full_text = " ".join(txt for _, txt, _ in self._buffer)
+            # Append partial if it has NEW content beyond what's in buffer
+            if self._partial_text:
+                # Check if partial adds words not in the last buffer entry
+                last_buf = self._buffer[-1][1] if self._buffer else ""
+                if self._partial_text not in full_text and self._partial_text != last_buf:
+                    full_text = full_text + " " + self._partial_text
+        else:
+            # Only partial, no finalized text yet — use partial directly
+            speaker   = self._partial_speaker or "Unknown"
+            t0        = time.time()
+            full_text = self._partial_text
+
         self._buffer.clear()
+        self._partial_text = ""
+        self._partial_speaker = ""
 
         # Reset VAD turn state
         self._vad.end_turn()
