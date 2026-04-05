@@ -10,12 +10,14 @@ Example:
 
 import asyncio
 import sys
+import os
 from dotenv import load_dotenv
+
+# Load .env BEFORE any other imports — modules read env vars at import time
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 from recall_bot import RecallBot
 from websocket_server import WebSocketServer
-
-load_dotenv()
 
 
 async def main(meeting_url: str, ws_base_url: str):
@@ -34,6 +36,19 @@ async def main(meeting_url: str, ws_base_url: str):
     bot_id = await bot.join(meeting_url, ws_url)
     server.speaker.bot_id = bot_id
 
+    # Debug: check bot status after a few seconds to verify transcription is working
+    await asyncio.sleep(5)
+    try:
+        status = await bot.get_status()
+        print(f"[Debug] Bot status: {status.get('status_changes', [{}])[-1].get('code', 'unknown')}")
+        # Check for transcription errors
+        recording = status.get('recording', {})
+        transcript_status = recording.get('transcript', {})
+        if transcript_status:
+            print(f"[Debug] Transcript config: {transcript_status}")
+    except Exception as e:
+        print(f"[Debug] Status check failed: {e}")
+
     print("\nPM Agent (Sam) is live in the meeting!")
     print("Everyone in the meeting will hear Sam's responses.")
     print("Press Ctrl+C to remove the bot and exit.\n")
@@ -46,8 +61,14 @@ async def main(meeting_url: str, ws_base_url: str):
         pass
     finally:
         print("\n[Shutting down] Removing bot from meeting...")
-        await bot.leave()
-        await server.speaker.close()
+        try:
+            await bot.leave()
+        except Exception as e:
+            print(f"[Shutdown] Bot leave failed (network issue): {e}")
+        try:
+            await server.speaker.close()
+        except Exception:
+            pass
         print("Done. Goodbye!")
 
 
