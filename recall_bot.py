@@ -86,13 +86,24 @@ class RecallBot:
     async def leave(self):
         if not self.bot_id:
             return
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"{RECALL_API_BASE}/bot/{self.bot_id}/leave_call/",
-                headers=self.headers,
-            )
-        print("[Recall.ai] Bot left the meeting.")
-        self.bot_id = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(
+                        f"{RECALL_API_BASE}/bot/{self.bot_id}/leave_call/",
+                        headers=self.headers,
+                    )
+                print("[Recall.ai] Bot left the meeting.")
+                self.bot_id = None
+                return
+            except Exception as e:
+                if attempt < 2:
+                    print(f"[Recall.ai] Leave failed (attempt {attempt+1}/3): {e}, retrying...")
+                    import asyncio
+                    await asyncio.sleep(1)
+                else:
+                    print(f"[Recall.ai] Leave failed after 3 attempts: {e}")
+                    self.bot_id = None
 
     async def get_status(self) -> dict:
         if not self.bot_id:
