@@ -323,7 +323,7 @@ class CartesiaSpeaker:
                         "transcript": "hi",
                         "voice": {"mode": "id", "id": "79a125e8-cd45-4c13-8a67-188112f4dd22"},
                         "language": "en",
-                        "output_format": {"container": "mp3", "sample_rate": 44100, "bit_rate": 128000},
+                        "output_format": {"container": "mp3", "sample_rate": 44100, "bit_rate": 192000},
                     },
                 )
                 if response.status_code in (200, 201):
@@ -364,7 +364,7 @@ class CartesiaSpeaker:
                 "output_format": {
                     "container":   "mp3",
                     "sample_rate": 44100,
-                    "bit_rate":    128000,
+                    "bit_rate":    192000,
                 },
             },
         )
@@ -375,6 +375,20 @@ class CartesiaSpeaker:
         if not self.bot_id:
             print("[Speaker] No bot_id — skipping inject")
             return
+
+        # Debug: save MP3 that gets sent to Recall.ai
+        if os.environ.get("DEBUG_SAVE_AUDIO", "").lower() in ("1", "true", "yes"):
+            try:
+                import base64 as _b64
+                raw = _b64.b64decode(b64_audio)
+                self._debug_audio_counter = getattr(self, '_debug_audio_counter', 0) + 1
+                fname = f"debug_inject_{self._debug_audio_counter:03d}.mp3"
+                with open(fname, "wb") as f:
+                    f.write(raw)
+                print(f"[Speaker] 🔧 Debug saved: {fname} ({len(raw)} bytes)")
+            except Exception as e:
+                print(f"[Speaker] Debug save failed: {e}")
+
         response = await self._recall_client.post(
             f"{RECALL_API_BASE}/bot/{self.bot_id}/output_audio/",
             headers=self._recall_headers,
