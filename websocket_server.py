@@ -1,16 +1,13 @@
 """
-websocket_server.py — Production-grade streaming voice pipeline
+websocket_server.py — Production voice pipeline (v2: EOT-first architecture)
 
 Pipeline:
-  Deepgram → Buffer+debounce → Trigger+Router parallel →
-    [PM] → LLM stream → sentence TTS → inject each ASAP
-    [FT] → filler inject → background search+TTS → inject or save pending
+  Deepgram final transcript → Buffer → EOT check (~150ms) →
+    COMPLETE → 500ms straggler wait → process
+    INCOMPLETE → 4s safety timeout → process anyway
 
-VAD integration (Silero via ONNX):
-  audio_mixed_raw.data → Silero VAD → speech/silence detection
-  - Filters coughs/noise (VAD confidence < 0.5)
-  - Smart turn detection: flush only when VAD confirms sustained silence
-  - Falls back to speech_off if VAD unavailable
+No more VAD flush, no debounce timers, no peak_rms filtering.
+VAD is kept only for audio monitoring and interrupt detection.
 """
 
 import asyncio
@@ -26,7 +23,7 @@ from collections import deque
 from Trigger import TriggerDetector
 from Agent import PMAgent, FILLERS
 from Speaker import CartesiaSpeaker, _mix_noise
-from vad import SileroVAD
+from vad import RmsVAD
 
 
 def ts():
@@ -45,6 +42,14 @@ _ACK_PHRASES = frozenset({
     "i am waiting", "no problem", "take your time", "np",
     "hello", "hi", "hey", "huh", "what", "sorry",
 })
+
+# ── Interrupt ack phrases — pre-baked at startup for instant playback ─────────
+_INTERRUPT_ACKS = [
+    "Oh sorry, go ahead.",
+    "My bad, what were you saying?",
+    "Sure, I'm listening.",
+    "Oh, go on.",
+]
 
 # ── Fix Deepgram misrecognitions ─────────────────────────────────────────────
 _TRANSCRIPTION_FIXES = [
@@ -67,6 +72,10 @@ def _is_ack(text: str) -> bool:
 
 
 class WebSocketServer:
+    # ── Timing constants ──────────────────────────────────────────────────────
+    STRAGGLER_WAIT  = 0.8   # seconds after RESPOND before processing (catch split transcripts)
+    WAIT_TIMEOUT    = 2.0   # seconds after WAIT — force process (speaker went silent)
+
     def __init__(self, port: int = 8000, bot_id: str = None):
         self.port           = port
         self.trigger        = TriggerDetector()
@@ -81,28 +90,32 @@ class WebSocketServer:
         self._current_speaker: str  = ""
         self._interrupt_event: asyncio.Event = asyncio.Event()
         self._generation:      int  = 0
+        self._last_spoke_at:   float = 0.0
 
-        self._buffer:      list = []
-        self._buffer_task: asyncio.Task | None = None
-
-        # Partial transcript — grows as user speaks, replaced by final
+        self._buffer:      list = []     # [(speaker, text, timestamp)]
         self._partial_text:    str = ""
         self._partial_speaker: str = ""
+        self._last_flushed_text: str = ""
+
+        # Interrupt handling — pre-baked ack audio for instant playback
+        self._was_interrupted: bool = False
+        self._interrupt_ack_audio: list[tuple[str, bytes]] = []
+
+        # EOT check task — the ONLY path to processing
+        self._eot_task: asyncio.Task | None = None
 
         # Search state
         self._searching = False
-        # Pending: list of (query_text, prepare_task) where prepare_task returns list[(sentence, audio_bytes)]
         self._pending_searches: list[tuple[str, asyncio.Task]] = []
 
         # TTS rate limiter — matches number of Cartesia keys
         self._tts_semaphore = asyncio.Semaphore(4)
 
-        # VAD — Silero via ONNX for smart turn detection
-        self._vad = SileroVAD()
-        # VAD silence threshold (ms) before flushing buffer
-        self.VAD_SILENCE_MS = 700
-        # Minimum words before VAD can trigger flush
-        self.VAD_MIN_WORDS = 2
+        # VAD — kept for audio monitoring and interrupt detection only
+        self._vad = RmsVAD()
+        # Debug: save raw audio to file for analysis
+        self.DEBUG_SAVE_AUDIO = True
+        self._debug_audio_file = None
 
         self.app = web.Application()
         self.app.router.add_get("/ws",     self.handle_websocket)
@@ -155,60 +168,136 @@ class WebSocketServer:
                 return
 
             text = _fix_transcription(text)
-            print(f"\n[{ts()}] [{speaker}] {text}  ⏱ {elapsed(t)}")
+            # Clean Gladia quirks: double spaces, leading dashes
+            text = _re.sub(r'\s+', ' ', text).strip().lstrip("-–— ").strip()
+            if not text:
+                return
+            buf_words = sum(len(txt.split()) for _, txt, _ in self._buffer)
+            print(f"\n[{ts()}] [{speaker}] {text}  ⏱ {elapsed(t)}  🔧 speaking={self._speaking} audio={self._audio_playing} buf={buf_words}w")
+
+            # ── Post-interrupt: discard this fragment, play ack ──
+            if self._was_interrupted:
+                self._was_interrupted = False
+                self._buffer.clear()
+                self._partial_text = ""
+                self._partial_speaker = ""
+                self._vad.end_turn()
+                self._last_flushed_text = ""
+                print(f"[{ts()}] 🙏 Post-interrupt — discarding \"{text}\", playing ack")
+                self.agent.log_exchange(speaker, text)
+                await self._play_interrupt_ack()
+                return
 
             # Final replaces any partial for this speaker
             self._partial_text = ""
             self._partial_speaker = ""
 
+            # Skip if this text was already flushed
+            if self._last_flushed_text:
+                flushed = self._last_flushed_text.lower().strip()
+                incoming = text.lower().strip()
+                flushed_words = set(flushed.split())
+                incoming_words = set(incoming.split())
+                overlap = len(flushed_words & incoming_words)
+                max_len = max(len(flushed_words), len(incoming_words), 1)
+                similarity = overlap / max_len
+                if incoming in flushed or flushed in incoming or similarity >= 0.7:
+                    print(f"[{ts()}] 🔕 Skipping — already flushed (sim={similarity:.0%}): \"{text}\"")
+                    self._last_flushed_text = ""
+                    self.agent.log_exchange(speaker, text)
+                    return
+            self._last_flushed_text = ""
+
             # Store in RAG immediately
             self.agent.log_exchange(speaker, text)
 
-            # ── Edge case: Ack during search/pending → ignore ─────────
-            if (self._searching or self._pending_searches) and self._current_speaker == speaker:
-                if _is_ack(text):
-                    print(f"[{ts()}] 🔕 Ack during search — ignored: \"{text}\"")
+            # ── Ack during processing/search → ignore ─────────
+            # Check BEFORE interrupt logic — acks like "Sure", "Ok" shouldn't cancel anything
+            if self._speaking and self._current_speaker == speaker:
+                # Clean transcript artifacts (leading dashes, etc) for ack check
+                clean_for_ack = text.lstrip("-–— ").strip()
+                if _is_ack(clean_for_ack):
+                    print(f"[{ts()}] 🔕 Ack during processing — ignored: \"{text}\"")
                     return
 
-            # ── Different speaker interrupts Sam ──────────────────────
+            # ── Different speaker while Sam is processing/speaking ──────
             if self._speaking and self._current_speaker != speaker:
-                print(f"[{ts()}] ⚡ INTERRUPT — {speaker} cut in")
                 if self._audio_playing:
+                    print(f"[{ts()}] ⚡ INTERRUPT — {speaker} cut in (audio playing)")
                     await self.speaker.stop_audio()
-                self._interrupt_event.set()
-                await asyncio.sleep(0.1)
-                self._buffer.clear()
-                self._buffer.append((speaker, text, t))
-                self._restart_debounce(speaker)
-                return
-
-            # ── Same speaker adds more while Sam is speaking ──────────
-            if self._speaking and self._current_speaker == speaker:
-                if self._searching:
-                    print(f"[{ts()}] 📥 New question during search — saving search to pending")
+                    self._interrupt_event.set()
                     if self._current_task and not self._current_task.done():
                         self._current_task.cancel()
-                    if self._audio_playing:
-                        await self.speaker.stop_audio()
+                    await asyncio.sleep(0.1)
                     self._speaking = False
                     self._audio_playing = False
-                    self._interrupt_event.set()
-                    await asyncio.sleep(0.1)
+                    self._searching = False
+                    self._buffer.clear()
+                    self._partial_text = ""
+                    self._partial_speaker = ""
+                    self._vad.end_turn()
+                    await self._play_interrupt_ack()
+                    return
                 else:
+                    # Pre-audio: cancel processing, re-buffer, re-check EOT
+                    print(f"[{ts()}] 📥 {speaker} added text (pre-audio) — cancelling + re-buffering")
                     if self._current_task and not self._current_task.done():
                         self._current_task.cancel()
-                    if self._audio_playing:
-                        await self.speaker.stop_audio()
+                    self._interrupt_event.set()
+                    await asyncio.sleep(0.05)
                     self._speaking = False
-                    self._audio_playing = False
+                    self._searching = False
+                    self._buffer.append((speaker, text, t))
+                    self._schedule_eot_check(speaker)
+                    return
+
+            # ── Same speaker adds more while Sam is processing/speaking ──
+            if self._speaking and self._current_speaker == speaker:
+                if self._audio_playing:
+                    print(f"[{ts()}] ⚡ INTERRUPT — {speaker} cut in (same speaker, audio playing)")
+                    if self._current_task and not self._current_task.done():
+                        self._current_task.cancel()
+                    await self.speaker.stop_audio()
                     self._interrupt_event.set()
                     await asyncio.sleep(0.1)
+                    self._speaking = False
+                    self._audio_playing = False
+                    self._searching = False
+                    self._buffer.clear()
+                    self._partial_text = ""
+                    self._partial_speaker = ""
+                    self._vad.end_turn()
+                    await self._play_interrupt_ack()
+                    return
+                else:
+                    # Pre-audio: bot is preparing response but hasn't spoken yet
+                    # Short utterances (≤6 words) from same speaker are likely
+                    # commentary ("you know?", "very confused"), NOT a new question
+                    word_count = len(text.split())
+                    if word_count <= 8:
+                        print(f"[{ts()}] 💬 Commentary during processing — absorbed: \"{text}\" ({word_count}w)")
+                        self.agent.log_exchange(speaker, text)  # still log to RAG
+                        return
+                    # Longer text = user is actually asking something new, cancel + re-buffer
+                    buf_words = sum(len(txt.split()) for _, txt, _ in self._buffer)
+                    print(f"[{ts()}] 📥 New question (pre-audio) — cancelling + re-buffering ({buf_words}+{word_count} words)")
+                    if self._current_task and not self._current_task.done():
+                        self._current_task.cancel()
+                    self._interrupt_event.set()
+                    await asyncio.sleep(0.05)
+                    self._speaking = False
+                    self._searching = False
+                    self._buffer.append((speaker, text, t))
+                    self._schedule_eot_check(speaker)
+                    return
 
-            # Buffer the final fragment
+            # ── Normal: buffer + run EOT check ────────────────────
             self._buffer.append((speaker, text, t))
-            self._restart_debounce(speaker)
+            buf_total = sum(len(txt.split()) for _, txt, _ in self._buffer)
+            print(f"[{ts()}] 📦 Buffered: {buf_total} words total → scheduling EOT check")
+            self._schedule_eot_check(speaker)
 
-        # ── Transcript (partial — low latency, updates as user speaks) ──
+        # ── Transcript (partial — updates as user speaks) ──
         elif event == "transcript.partial_data":
             inner   = payload.get("data", {}).get("data", {})
             words   = inner.get("words", [])
@@ -218,42 +307,40 @@ class WebSocketServer:
                 return
 
             text = _fix_transcription(text)
-            # Replace previous partial (partials grow: "Sam" → "Sam tell me" → "Sam tell me about")
+            text = _re.sub(r'\s+', ' ', text).strip().lstrip("-–— ").strip()
+            if not text:
+                return
             self._partial_text = text
             self._partial_speaker = speaker
-            # Restart debounce — receiving partials means user is still speaking
-            self._restart_debounce(speaker)
+            # Partial means user is still speaking — cancel any pending EOT check
+            if self._eot_task and not self._eot_task.done():
+                self._eot_task.cancel()
 
-        # ── Speech OFF → fallback flush if VAD didn't catch it ──────────
+        # ── Speech OFF ──────────────────────────────────────────────
         elif event == "participant_events.speech_off":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
             print(f"[{ts()}] 🔇 {speaker} stopped speaking")
-            # If VAD is active, it handles flush from audio stream
-            # speech_off just resets debounce as safety — VAD or debounce will flush
-            if not self._vad.ready:
-                # No VAD — flush immediately (old behavior)
-                if self._buffer_task and not self._buffer_task.done():
-                    self._buffer_task.cancel()
-                if self._buffer and not self._speaking:
-                    self._flush_buffer()
 
         elif event == "participant_events.speech_on":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
             print(f"[{ts()}] 🎤 {speaker} started speaking")
 
+            # Interrupt detection: only when bot is audibly playing
             if self._speaking and self._current_speaker != speaker:
-                print(f"[{ts()}] ⚡ INTERRUPT (speech_on) — {speaker} cut in")
                 if self._audio_playing:
+                    print(f"[{ts()}] ⚡ INTERRUPT (speech_on) — {speaker} cut in")
                     await self.speaker.stop_audio()
                     await asyncio.sleep(0.1)
-                self._interrupt_event.set()
+                    self._interrupt_event.set()
+                    if self._current_task and not self._current_task.done():
+                        self._current_task.cancel()
+                    self._speaking = False
+                    self._audio_playing = False
+                    self._was_interrupted = True
 
-        # ── Raw audio → Silero VAD → self-triggered flush ─────────────────
+        # ── Raw audio → VAD monitoring only (no flush decisions) ─────
         elif event == "audio_mixed_raw.data":
-            if not self._vad.ready:
-                return
-            # Don't run VAD while bot is speaking (mixed audio includes bot's TTS)
-            if self._audio_playing:
+            if not self._vad.ready or self._audio_playing:
                 return
 
             audio_b64 = payload.get("data", {}).get("data", {}).get("buffer", "")
@@ -262,35 +349,29 @@ class WebSocketServer:
 
             try:
                 pcm_bytes = base64.b64decode(audio_b64)
-                confidences = self._vad.process_chunk(pcm_bytes)
 
-                for conf in confidences:
-                    self._vad.update_state(conf, threshold=0.05)
+                if self.DEBUG_SAVE_AUDIO:
+                    if self._debug_audio_file is None:
+                        self._debug_audio_file = open("debug_audio.raw", "wb")
+                        print(f"[{ts()}] 🔧 Debug audio saving to debug_audio.raw")
+                    self._debug_audio_file.write(pcm_bytes)
 
-                # Debug logging
+                rms_values = self._vad.process_chunk(pcm_bytes)
+                for rms in rms_values:
+                    self._vad.update_state(rms)
+
+                # Periodic debug logging
                 if not hasattr(self, '_audio_event_count'):
                     self._audio_event_count = 0
                     self._max_conf = 0.0
                 self._audio_event_count += 1
-                if confidences:
-                    self._max_conf = max(self._max_conf, max(confidences))
+                if rms_values:
+                    self._max_conf = max(self._max_conf, max(rms_values))
 
                 if self._audio_event_count == 1:
                     print(f"[{ts()}] 🔊 First audio_mixed_raw received ({len(pcm_bytes)} bytes)")
-                elif self._audio_event_count % 100 == 0:
-                    print(f"[{ts()}] 🔊 Audio#{self._audio_event_count} heard={self._vad.heard_speech} conf={self._vad.last_confidence:.3f} max={self._max_conf:.3f} silence={self._vad.silence_duration_ms():.0f}ms buf={len(self._buffer)}")
-
-                # ── VAD-triggered flush: heard speech + sustained silence → flush
-                has_text = bool(self._buffer) or bool(self._partial_text)
-                if self._vad.heard_speech and has_text and not self._speaking:
-                    silence_ms = self._vad.silence_duration_ms()
-                    word_count = sum(len(txt.split()) for _, txt, _ in self._buffer)
-                    word_count += len(self._partial_text.split()) if self._partial_text else 0
-                    if silence_ms >= self.VAD_SILENCE_MS and word_count >= self.VAD_MIN_WORDS:
-                        print(f"[{ts()}] 🎯 VAD flush: {silence_ms:.0f}ms silence, {word_count} words (buf={len(self._buffer)} partial={len(self._partial_text.split()) if self._partial_text else 0})")
-                        if self._buffer_task and not self._buffer_task.done():
-                            self._buffer_task.cancel()
-                        self._flush_buffer()
+                elif self._audio_event_count % 200 == 0:
+                    print(f"[{ts()}] 🔊 Audio#{self._audio_event_count} rms={self._vad.last_confidence:.4f} max={self._max_conf:.4f} buf={len(self._buffer)}")
 
             except Exception as e:
                 print(f"[{ts()}] ⚠️  VAD error: {e}")
@@ -307,7 +388,114 @@ class WebSocketServer:
                 print(f"[{ts()}] 👋 {name} left")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Buffer + debounce
+    # EOT-first turn detection (the ONLY path to processing)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _schedule_eot_check(self, speaker: str):
+        """Cancel any pending EOT check and schedule a new one."""
+        if self._eot_task and not self._eot_task.done():
+            self._eot_task.cancel()
+        self._eot_task = asyncio.create_task(self._run_eot_check(speaker))
+
+    async def _run_eot_check(self, speaker: str):
+        """Context-aware turn detection: should Sam respond now or wait?
+        
+        Flow:
+          1. Run EOT classifier with conversation context (~150ms)
+          2. RESPOND → wait 0.8s for stragglers → process
+          3. WAIT → wait 6s (speaker still going) → force process if no new text
+          
+        Any new transcript (final or partial) cancels this task and triggers a fresh check.
+        """
+        try:
+            result = self._get_buffer_text()
+            if not result or self._speaking:
+                return
+
+            spk, full_text, t0 = result
+            word_count = len(full_text.split())
+
+            # Get conversation context for the EOT classifier
+            context = "\n".join(self._convo_history)
+            ctx_count = len(self._convo_history)
+            print(f"[{ts()}] 📋 EOT context ({ctx_count} entries): {list(self._convo_history)[-3:] if self._convo_history else '(EMPTY)'}")
+
+            # Ask the LLM: should Sam respond now or wait?
+            decision = await self.agent.check_end_of_turn(full_text, context)
+
+            if decision == "RESPOND":
+                # ── Speaker expects a response — short straggler wait then process ──
+                print(f"[{ts()}] [EOT] 🟢 RESPOND — waiting {self.STRAGGLER_WAIT}s for stragglers...")
+                await asyncio.sleep(self.STRAGGLER_WAIT)
+
+                if self._speaking:
+                    print(f"[{ts()}] 🛑 Post-straggler: already speaking — skip")
+                    return
+                if not self._buffer:
+                    print(f"[{ts()}] 🛑 Post-straggler: buffer empty — skip")
+                    return
+
+                # Re-read buffer (might have grown during straggler wait)
+                result = self._get_buffer_text()
+                if not result:
+                    return
+                spk, full_text, t0 = result
+
+                self._buffer.clear()
+                self._partial_text = ""
+                self._partial_speaker = ""
+                self._vad.end_turn()
+                self._last_flushed_text = full_text
+                print(f"[{ts()}] 📝 Turn complete: \"{full_text}\"")
+                self._start_process(full_text, spk, t0)
+
+            else:
+                # ── Speaker still going — long wait, let them finish ──
+                print(f"[{ts()}] [EOT] 🟡 WAIT — listening for {self.WAIT_TIMEOUT}s...")
+                await asyncio.sleep(self.WAIT_TIMEOUT)
+
+                if self._speaking or not self._buffer:
+                    return
+
+                result = self._get_buffer_text()
+                if not result:
+                    return
+                spk, full_text, t0 = result
+
+                self._buffer.clear()
+                self._partial_text = ""
+                self._partial_speaker = ""
+                self._vad.end_turn()
+                self._last_flushed_text = full_text
+                print(f"[{ts()}] 📝 Wait timeout — processing: \"{full_text}\"")
+                self._start_process(full_text, spk, t0)
+
+        except asyncio.CancelledError:
+            # New transcript arrived — will schedule a fresh EOT check
+            return
+
+    def _get_buffer_text(self) -> tuple[str, str, float] | None:
+        """Extract accumulated text from buffer without clearing. Returns (speaker, text, t0) or None."""
+        if not self._buffer and not self._partial_text:
+            return None
+
+        if self._buffer:
+            speaker   = self._buffer[-1][0]
+            t0        = self._buffer[0][2]
+            full_text = " ".join(txt for _, txt, _ in self._buffer)
+            if self._partial_text:
+                last_buf = self._buffer[-1][1] if self._buffer else ""
+                if self._partial_text not in full_text and self._partial_text != last_buf:
+                    full_text = full_text + " " + self._partial_text
+        else:
+            speaker   = self._partial_speaker or "Unknown"
+            t0        = time.time()
+            full_text = self._partial_text
+
+        return speaker, full_text, t0
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Process launcher + helpers
     # ══════════════════════════════════════════════════════════════════════════
 
     def _start_process(self, text, speaker, t0):
@@ -316,10 +504,12 @@ class WebSocketServer:
         self._current_text    = text
         self._current_speaker = speaker
         self._interrupt_event.clear()
+        # Log user message to conversation history (EOT + process both need this)
+        self._convo_history.append(f"{speaker}: {text}")
         self._current_task = asyncio.create_task(self._process(text, speaker, t0, my_gen))
 
     async def _greet(self, name, t0):
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
         if self._speaking:
             return
         greeting = f"Hey {name}, welcome to the call!"
@@ -330,67 +520,54 @@ class WebSocketServer:
         self._convo_history.append(f"Sam: {text}")
         self.agent.log_exchange("Sam", text)
 
-    def _restart_debounce(self, speaker: str):
-        if self._buffer_task and not self._buffer_task.done():
-            self._buffer_task.cancel()
-        self._buffer_task = asyncio.create_task(self._debounce_then_flush(speaker))
-
-    async def _debounce_then_flush(self, speaker: str):
-        try:
-            timeout = 2.5 if self._vad.ready else 1.0
-            await asyncio.sleep(timeout)
-        except asyncio.CancelledError:
-            return
-        if (self._buffer or self._partial_text) and not self._speaking:
-            print(f"[{ts()}] ⏰ Debounce safety flush ({2.5 if self._vad.ready else 1.0}s)")
-            self._flush_buffer()
-
-    def _flush_buffer(self):
-        # Combine finalized buffer + any remaining partial
-        if not self._buffer and not self._partial_text:
-            return
-
-        if self._buffer:
-            speaker   = self._buffer[-1][0]
-            t0        = self._buffer[0][2]
-            full_text = " ".join(txt for _, txt, _ in self._buffer)
-            # Append partial if it has NEW content beyond what's in buffer
-            if self._partial_text:
-                # Check if partial adds words not in the last buffer entry
-                last_buf = self._buffer[-1][1] if self._buffer else ""
-                if self._partial_text not in full_text and self._partial_text != last_buf:
-                    full_text = full_text + " " + self._partial_text
-        else:
-            # Only partial, no finalized text yet — use partial directly
-            speaker   = self._partial_speaker or "Unknown"
-            t0        = time.time()
-            full_text = self._partial_text
-
-        self._buffer.clear()
-        self._partial_text = ""
-        self._partial_speaker = ""
-
-        # Reset VAD turn state
-        self._vad.end_turn()
-
-        print(f"[{ts()}] 📝 Buffered complete: \"{full_text}\"")
-        self._start_process(full_text, speaker, t0)
-
     # ══════════════════════════════════════════════════════════════════════════
     # TTS + inject helpers
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _tts(self, text: str) -> bytes:
-        async with self._tts_semaphore:
-            return await self.speaker._synthesise(text)
+    async def _tts(self, text: str, retries: int = 2) -> bytes:
+        """TTS with retry for transient DNS/network errors."""
+        last_err = None
+        for attempt in range(1 + retries):
+            try:
+                async with self._tts_semaphore:
+                    return await self.speaker._synthesise(text)
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "getaddrinfo" in err_str or "ConnectError" in err_str or "TimeoutError" in err_str:
+                    if attempt < retries:
+                        wait = 0.5 * (attempt + 1)
+                        print(f"[{ts()}] ⚠️  TTS DNS error (attempt {attempt+1}/{1+retries}), retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                raise  # non-network error, don't retry
+        raise last_err
 
-    async def _inject_and_wait(self, audio_bytes: bytes, text: str, label: str, my_gen: int) -> bool:
+    def _combine_audio(self, audio_list: list[bytes]) -> bytes:
+        """Combine multiple MP3 audio bytes into one seamless MP3."""
+        from pydub import AudioSegment
+        import io
+        combined = AudioSegment.empty()
+        for audio_bytes in audio_list:
+            seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+            combined += seg
+        output = io.BytesIO()
+        combined.export(output, format="mp3", bitrate="64k")
+        return output.getvalue()
+
+    async def _inject_and_wait(self, audio_bytes: bytes, text: str, label: str, my_gen: int, stop_first: bool = True) -> bool:
         """Inject audio + interruptible playback wait. Returns False if interrupted."""
         if self._interrupt_event.is_set() or my_gen != self._generation:
             return False
 
         try:
             t_inj = time.time()
+            if stop_first:
+                try:
+                    await self.speaker.stop_audio()
+                except Exception:
+                    pass
+
             b64 = base64.b64encode(audio_bytes).decode("utf-8")
             await self.speaker._inject_into_meeting(b64)
             self._audio_playing = True
@@ -421,6 +598,23 @@ class WebSocketServer:
             await self._inject_and_wait(audio, text, "greeting", self._generation)
         except Exception as e:
             print(f"[{ts()}] ⚠️  _speak_simple error: {e}")
+        finally:
+            self._speaking = False
+            self._audio_playing = False
+
+    async def _play_interrupt_ack(self):
+        """Play a pre-baked interrupt ack INSTANTLY (no TTS wait)."""
+        if not self._interrupt_ack_audio:
+            return
+        self._interrupt_event.clear()
+        self._generation += 1
+        self._speaking = True
+        try:
+            text, audio = random.choice(self._interrupt_ack_audio)
+            print(f"[{ts()}] 🙏 Interrupt ack (instant): \"{text}\"")
+            await self._inject_and_wait(audio, text, "interrupt-ack", self._generation)
+        except Exception as e:
+            print(f"[{ts()}] ⚠️  Interrupt ack error: {e}")
         finally:
             self._speaking = False
             self._audio_playing = False
@@ -465,21 +659,18 @@ class WebSocketServer:
             if not prepared:
                 continue
 
-            # Add prefix ONLY for pending delivery — "Oh and about your earlier question"
             prefix = "Oh and about your earlier question."
             try:
                 prefix_audio = await self._tts(prefix)
-                ok = await self._inject_and_wait(prefix_audio, prefix, "pending-prefix", my_gen)
+                all_audio = [prefix_audio] + [audio for _, audio in prepared]
+                combined_audio = self._combine_audio(all_audio)
+                full_text = " ".join(sent for sent, _ in prepared)
+                ok = await self._inject_and_wait(combined_audio, f"{prefix} {full_text}", "pending-combined", my_gen)
                 if not ok:
                     return
-            except Exception:
-                pass
-
-            full_text = " ".join(sent for sent, _ in prepared)
-            for i, (sent, audio_bytes) in enumerate(prepared):
-                ok = await self._inject_and_wait(audio_bytes, sent, f"pending-{i+1}", my_gen)
-                if not ok:
-                    return
+            except Exception as e:
+                print(f"[{ts()}] ⚠️  Pending delivery error: {e}")
+                continue
 
             self._log_sam(f"{prefix} {full_text}")
             self.trigger.mark_responded()
@@ -500,8 +691,9 @@ class WebSocketServer:
 
         try:
             context = "\n".join(self._convo_history)
+            print(f"[{ts()}] 📋 Process context ({len(self._convo_history)} entries): {list(self._convo_history)[-3:] if self._convo_history else '(EMPTY)'}")
             t1 = time.time()
-            _active_prepare_task = None  # track for CancelledError cleanup
+            _active_prepare_task = None
             _active_search_text = text
 
             # ── Trigger + Router in parallel ─────────────────────────────
@@ -528,32 +720,27 @@ class WebSocketServer:
             # [FT] PATH — filler + background search + TTS
             # ══════════════════════════════════════════════════════════════
             if route == "FT":
-                # 1. Fire search + TTS in background immediately
                 prepare_task = asyncio.create_task(
                     self._search_and_prepare_audio(text, context)
                 )
                 _active_prepare_task = prepare_task
                 self._searching = True
 
-                # 2. Play filler
                 filler = random.choice(FILLERS)
                 print(f"[{ts()}] 🗣️ Filler: \"{filler}\"")
                 try:
                     filler_audio = await self._tts(filler)
                 except Exception as e:
                     print(f"[{ts()}] ⚠️  Filler TTS failed: {e}")
-                    # Wait for search directly
                     filler_audio = None
 
                 if filler_audio:
                     ok = await self._inject_and_wait(filler_audio, filler, "filler", my_gen)
                     if not ok:
-                        # Interrupted during filler — save search for later
-                        self._pending_searches.append((text, prepare_task))
-                        print(f"[{ts()}] 📥 Search saved to pending")
+                        prepare_task.cancel()
+                        print(f"[{ts()}] ⚡ Interrupted during filler — discarding search")
                         return
 
-                # 3. Wait for search + TTS
                 try:
                     prepared = await asyncio.wait_for(prepare_task, timeout=15)
                 except asyncio.TimeoutError:
@@ -569,29 +756,21 @@ class WebSocketServer:
                     return
 
                 if self._interrupt_event.is_set() or my_gen != self._generation:
-                    # Interrupted after ready — save for later
-                    fut = asyncio.get_event_loop().create_future()
-                    fut.set_result(prepared)
-                    self._pending_searches.append((text, fut))
-                    print(f"[{ts()}] 📥 Search ready but interrupted — saved to pending")
                     return
 
                 if not prepared:
                     return
 
-                # 4. Inject pre-baked audio (0ms TTS wait)
                 full_text = " ".join(sent for sent, _ in prepared)
-                for i, (sent, audio_bytes) in enumerate(prepared):
-                    ok = await self._inject_and_wait(audio_bytes, sent, f"search-{i+1}", my_gen)
-                    if not ok:
-                        break
+                combined_audio = self._combine_audio([audio for _, audio in prepared])
+                ok = await self._inject_and_wait(combined_audio, full_text, "search-combined", my_gen)
 
                 self._log_sam(full_text)
                 self.trigger.mark_responded()
                 print(f"[{ts()}] ✅ Done (search)")
 
             # ══════════════════════════════════════════════════════════════
-            # [PM] PATH — stream LLM + sentence TTS + inject each ASAP
+            # [PM] PATH — stream LLM + parallel TTS + seamless inject
             # ══════════════════════════════════════════════════════════════
             else:
                 sentence_queue = asyncio.Queue()
@@ -600,70 +779,125 @@ class WebSocketServer:
                 )
 
                 all_sentences: list[str] = []
-                pending_tts: list[tuple[str, asyncio.Task]] = []
 
+                # ── Get first sentence ──
+                first_item = None
                 while True:
                     if self._interrupt_event.is_set() or my_gen != self._generation:
                         llm_task.cancel()
-                        for _, t_task in pending_tts:
-                            t_task.cancel()
                         return
-
                     try:
                         item = await asyncio.wait_for(sentence_queue.get(), timeout=15.0)
                     except asyncio.TimeoutError:
                         print(f"[{ts()}] ⚠️  LLM queue timeout")
                         break
-
-                    if item is None:
-                        break
-
-                    if item == "__FLUSH__":
+                    if item is None or item == "__FLUSH__":
+                        if item is None:
+                            break
                         continue
+                    first_item = item
+                    break
 
-                    all_sentences.append(item)
-                    idx = len(all_sentences)
-                    print(f"[{ts()}] LLM sentence {idx} ({elapsed(t1)}): \"{item}\"")
-                    pending_tts.append((item, asyncio.create_task(self._tts(item))))
+                if not first_item:
+                    llm_task.cancel()
+                    return
 
-                    # Inject first sentence immediately
-                    if idx == 1:
-                        sent, task = pending_tts.pop(0)
+                all_sentences.append(first_item)
+                print(f"[{ts()}] LLM sentence 1 ({elapsed(t1)}): \"{first_item}\"")
+
+                # ── TTS sentence 1 ──
+                try:
+                    audio_bytes = await self._tts(first_item)
+                    print(f"[{ts()}] ⏱ TTS sentence 1: {elapsed(t1)}")
+                except Exception as e:
+                    print(f"[{ts()}] ⚠️  TTS sentence 1 failed: {e}")
+                    llm_task.cancel()
+                    return
+
+                # ── Start background task: drain + TTS + COMBINE while sentence 1 plays ──
+                async def _prepare_remaining():
+                    """Drain queue, TTS all sentences, combine into one audio — all during playback."""
+                    texts = []
+                    pending_tts = []
+                    while True:
                         try:
-                            audio_bytes = await task
-                            print(f"[{ts()}] ⏱ TTS sentence 1: {elapsed(t1)}")
+                            item = await asyncio.wait_for(sentence_queue.get(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            break
+                        if item is None:
+                            break
+                        if item == "__FLUSH__":
+                            continue
+                        if self._interrupt_event.is_set() or my_gen != self._generation:
+                            break
+                        texts.append(item)
+                        pending_tts.append((item, asyncio.create_task(self._tts(item))))
 
-                            ok = await self._inject_and_wait(audio_bytes, sent, "sentence-1", my_gen)
-                            if ok:
-                                print(f"[{ts()}] 📊 FIRST AUDIO: {elapsed(t0)}")
-                            else:
-                                self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
-                                self.trigger.mark_responded()
-                                llm_task.cancel()
-                                for _, t_task in pending_tts:
-                                    t_task.cancel()
-                                return
+                    # Wait for all TTS and combine into single audio
+                    audio_parts = []
+                    for s, task in pending_tts:
+                        try:
+                            ab = await task
+                            audio_parts.append(ab)
                         except Exception as e:
-                            print(f"[{ts()}] ⚠️  TTS sentence 1 failed: {e}")
+                            print(f"[{ts()}] ⚠️  TTS failed for \"{s[:30]}\": {e}")
 
-                # Inject remaining (TTS already done from prefetch)
-                for i, (sent, task) in enumerate(pending_tts):
-                    if self._interrupt_event.is_set() or my_gen != self._generation:
-                        for _, t_task in pending_tts[i:]:
-                            t_task.cancel()
-                        return
+                    if audio_parts:
+                        combined = self._combine_audio(audio_parts)
+                        combined_text = " ".join(texts)
+                        # Pre-encode base64 so inject is just a network call
+                        combined_b64 = base64.b64encode(combined).decode("utf-8")
+                        return texts, combined_b64, combined_text
+                    return texts, None, None
 
+                prepare_task = asyncio.create_task(_prepare_remaining())
+
+                # ── Inject sentence 1 + wait for playback ──
+                ok = await self._inject_and_wait(audio_bytes, first_item, "sentence-1", my_gen)
+                if ok:
+                    print(f"[{ts()}] 📊 FIRST AUDIO: {elapsed(t0)}")
+                    self._interrupt_event.clear()
+                else:
+                    self._log_sam(f"{first_item} [interrupted]")
+                    self.trigger.mark_responded()
+                    llm_task.cancel()
+                    prepare_task.cancel()
+                    return
+
+                # ── Sentence 1 done — inject pre-combined remaining audio instantly ──
+                try:
+                    remaining_text, combined_b64, combined_text = await asyncio.wait_for(prepare_task, timeout=10.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    remaining_text, combined_b64, combined_text = [], None, None
+
+                if remaining_text:
+                    all_sentences.extend(remaining_text)
+                    for i, s in enumerate(remaining_text):
+                        print(f"[{ts()}] LLM sentence {i+2} ({elapsed(t1)}): \"{s}\"")
+
+                if combined_b64 and not self._interrupt_event.is_set() and my_gen == self._generation:
+                    # Inject directly — audio already combined + base64 encoded
+                    print(f"[{ts()}] 🔊 Injecting sentence-rest: \"{combined_text[:60]}\"")
+                    t_inj = time.time()
                     try:
-                        audio_bytes = await task
-                        ok = await self._inject_and_wait(audio_bytes, sent, f"sentence-{i+2}", my_gen)
-                        if not ok:
+                        await self.speaker._inject_into_meeting(combined_b64)
+                        self._audio_playing = True
+                        print(f"[{ts()}] ⏱ Inject sentence-rest: {elapsed(t_inj)}")
+                        # Wait for playback
+                        play_dur = max(500, len(combined_text.split()) * 350 + 300)
+                        try:
+                            await asyncio.wait_for(self._interrupt_event.wait(), timeout=play_dur / 1000)
+                            print(f"[{ts()}] ⚡ Interrupted during sentence-rest")
+                            self._audio_playing = False
                             self._log_sam(f"{' '.join(all_sentences)} [interrupted]")
                             self.trigger.mark_responded()
-                            for _, t_task in pending_tts[i+1:]:
-                                t_task.cancel()
                             return
+                        except asyncio.TimeoutError:
+                            pass
+                        self._audio_playing = False
                     except Exception as e:
-                        print(f"[{ts()}] ⚠️  TTS sentence {i+2} failed: {e}")
+                        print(f"[{ts()}] ⚠️  Inject sentence-rest failed: {e}")
+                        self._audio_playing = False
 
                 if all_sentences:
                     self._log_sam(' '.join(all_sentences))
@@ -671,25 +905,10 @@ class WebSocketServer:
                     print(f"[{ts()}] 📊 TOTAL: {elapsed(t0)}")
                     print(f"[{ts()}] ✅ Done (PM)")
 
-            # ── Deliver any pending search results ───────────────────────
-            await self._deliver_pending(my_gen)
-
         except asyncio.CancelledError:
             print(f"[{ts()}] 🔄 Task cancelled")
-            # Save active search to pending so results aren't lost
             if _active_prepare_task and not _active_prepare_task.done():
-                self._pending_searches.append((_active_search_text, _active_prepare_task))
-                print(f"[{ts()}] 📥 Active search saved to pending: \"{_active_search_text[:50]}\"")
-            elif _active_prepare_task and _active_prepare_task.done():
-                try:
-                    result = _active_prepare_task.result()
-                    if result:
-                        fut = asyncio.get_event_loop().create_future()
-                        fut.set_result(result)
-                        self._pending_searches.append((_active_search_text, fut))
-                        print(f"[{ts()}] 📥 Completed search saved to pending: \"{_active_search_text[:50]}\"")
-                except Exception:
-                    pass
+                _active_prepare_task.cancel()
         except Exception as e:
             import traceback
             print(f"[{ts()}] ❌ _process error: {e}")
@@ -707,6 +926,24 @@ class WebSocketServer:
         self.agent.start()
         await self.speaker.warmup()
         await self._vad.setup()
+
+        # Clear debug file for fresh run
+        try:
+            with open("debug_prompts.txt", "w", encoding="utf-8") as f:
+                f.write(f"=== Debug session started at {ts()} ===\n")
+            print(f"[{ts()}] 📝 Debug logging to debug_prompts.txt")
+        except Exception:
+            pass
+
+        # Pre-bake interrupt ack audio for instant playback
+        print(f"[{ts()}] Pre-baking interrupt ack audio...")
+        for phrase in _INTERRUPT_ACKS:
+            try:
+                audio = await self._tts(phrase)
+                self._interrupt_ack_audio.append((phrase, audio))
+            except Exception as e:
+                print(f"[{ts()}] ⚠️  Pre-bake failed for \"{phrase}\": {e}")
+        print(f"[{ts()}] ✅ {len(self._interrupt_ack_audio)} interrupt acks pre-baked")
 
         runner = web.AppRunner(self.app)
         await runner.setup()
