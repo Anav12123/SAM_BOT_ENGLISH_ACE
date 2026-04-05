@@ -21,6 +21,25 @@ from openai import AsyncOpenAI
 from typing import List, Optional
 
 
+# ── Debug logger — writes all prompt inputs to file ──────────────────────────
+DEBUG_PROMPTS_FILE = "debug_prompts.txt"
+
+def _debug_log(label: str, **kwargs):
+    """Append a debug entry to debug_prompts.txt with timestamp and all variables."""
+    try:
+        ts = time.strftime("%H:%M:%S")
+        with open(DEBUG_PROMPTS_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"[{ts}] {label}\n")
+            f.write(f"{'='*80}\n")
+            for key, val in kwargs.items():
+                val_str = str(val) if val else "(EMPTY)"
+                f.write(f"  {key}:\n    {val_str}\n")
+            f.write(f"\n")
+    except Exception:
+        pass  # never crash on debug logging
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # IN-MEMORY RAG STORE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,7 +145,7 @@ class MeetingRAG:
         # Fallback: keyword search
         return self._keyword_search(query, top_k)
 
-    def _keyword_search(self, query: str, top_k: int = 5) -> List[str]:
+    def _keyword_search(self, query: str, top_k: int = 5, exclude_text: str = "") -> List[str]:
         stop = {"the", "a", "an", "is", "are", "was", "were", "what", "who",
                 "how", "when", "where", "why", "did", "do", "does", "can",
                 "could", "would", "should", "we", "i", "you", "they", "it",
@@ -134,9 +153,15 @@ class MeetingRAG:
         query_words = {w for w in query.lower().split() if w not in stop and len(w) > 2}
         if not query_words:
             return []
+        # Normalize exclude text for comparison
+        exclude_lower = exclude_text.lower().strip() if exclude_text else ""
         scored = []
         for entry in self._entries:
-            hits = sum(1 for w in query_words if w in entry["text"].lower())
+            entry_lower = entry["text"].lower().strip()
+            # Skip if this entry IS the current utterance (prevent echo)
+            if exclude_lower and (exclude_lower in entry_lower or entry_lower.endswith(exclude_lower)):
+                continue
+            hits = sum(1 for w in query_words if w in entry_lower)
             if hits > 0:
                 scored.append((hits, entry["text"]))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -165,52 +190,89 @@ class MeetingRAG:
 
 # ── FAST ROUTER — classifies before main LLM ────────────────────────────────
 ROUTER_PROMPT = """Classify this message. Reply with ONLY one tag:
-[PM] — if it's a greeting, small talk, personal question, joke, PM topic (agenda, blockers, sprint, timeline, CRM, team), or anything about AnavClouds/Salesforce/project management.
-[FT] — if it needs real-world facts: names, numbers, dates, news, weather, history, science, company details, people, events, prices, statistics, or any verifiable information.
+[PM] — greetings, small talk, personal questions, jokes, opinions, PM work topics (agenda, blockers, sprint status, timeline, team updates), conversation about ongoing work, AND any question about what was said earlier in THIS conversation (memory, recall, "what did I ask", "repeat that", "come again", "previous question").
+[FT] — ANY question needing verifiable facts from the OUTSIDE WORLD: who is someone (CEO, founder, president), company info (rates, pricing, services), real-world knowledge (people, places, events, news, weather, science, history, dates, numbers, statistics).
+
+IMPORTANT:
+- If the user asks WHO someone is (CEO, founder, manager), or asks about PRICES/RATES/COSTS — always [FT], even if they say "our company".
+- If the user asks about what THEY said earlier, what was discussed, or asks you to repeat — always [PM], this is conversation memory not web search.
+
+Examples:
+"Hi Sam, how are you?" → [PM]
+"What's on the agenda?" → [PM]
+"Who is the CEO of our company?" → [FT]
+"What are the hourly rates?" → [FT]
+"Who is the prime minister of India?" → [FT]
+"Tell me about yourself" → [PM]
+"What's the founder's name?" → [FT]
+"How's the sprint going?" → [PM]
+"What services does our company offer?" → [FT]
+"What was my previous question?" → [PM]
+"Can you repeat that?" → [PM]
+"What did I just ask you?" → [PM]
+"Come again?" → [PM]
+"Describe yourself in three words" → [PM]
 
 ONLY reply with [PM] or [FT]. Nothing else."""
 
 # ── PM PROMPT — only handles personality + PM answers ────────────────────────
-PM_PROMPT = """You are Sam, senior PM at AnavClouds Software Solutions (Salesforce + AI company).
-You're on a live voice call. Sharp, witty, a little sarcastic — but always professional.
+PM_PROMPT = """You are Sam, a senior PM at AnavClouds Software Solutions. You're on a live voice call in a meeting.
 
-PERSONALITY: Warm but direct. Light sarcasm. Deflect personal/romantic questions with humor. Confident.
+HOW YOU TALK:
+- Like a real person in a meeting, not a chatbot. Use "yeah", "honestly", "look", "so basically".
+- React to what the person ACTUALLY said before answering. Show you're listening.
+- Use their name naturally (not every time — that's weird).
+- Contractions always. Never say "I am" when you can say "I'm".
+- Throw in light humor when it fits. You're the fun PM, not the boring one.
+- If they ask for a joke, deliver the FULL joke with setup AND punchline in one response.
 
-YOUR KNOWLEDGE:
-- You are Sam, senior PM at AnavClouds. You handle sprints, budgets, timelines.
-- AnavClouds does Salesforce + AI solutions, CRM integrations, intelligent automation.
-- General PM topics: agenda, blockers, sprint status, timelines, CRM rollout, team updates.
-- Greetings, small talk, jokes, personal deflections.
-- Meeting memory (if provided below).
+YOUR BACKGROUND:
+- Senior PM at AnavClouds (Salesforce + AI company). You handle sprints, budgets, timelines, CRM rollouts.
+- Confident, warm, slightly sarcastic. You deflect weird questions with humor.
+- You remember what was said in the meeting (see MEETING MEMORY below).
 
 RULES:
-- 2 sentences. Each ending with a period. Each 8-12 words.
-- NEVER repeat what you said before. Say something NEW every time.
-- Be conversational and natural. React to what the user actually said.
-- Contractions. No lists/markdown.
+- 1-2 sentences. Max 20 words per sentence.
+- If user asks to REPEAT something: rephrase your last answer differently.
+- Say something NEW each time — don't repeat yourself.
+- No markdown, no lists, no asterisks, no bullet points, no parenthetical actions like (laughs) or (sighs) — this is voice output, not a script.
 
-MEETING MEMORY: If provided, use it to answer about past discussions."""
+MEETING MEMORY: Use this to answer about past discussions if provided."""
 
-SEARCH_SUMMARY_PROMPT = """You are Sam, a witty senior PM on a live voice call.
-You searched the web. Here are the results:
+SEARCH_SUMMARY_PROMPT = """You are Sam, a PM on a live voice call. You just searched the web for the user.
 
+Search results:
 {search_results}
 
 Rules:
-- Do NOT start with a filler — the user already heard one.
-- Go DIRECTLY to the answer.
-- 2-3 SHORT sentences. Each max 18 words.
-- Be conversational and confident. Add a tiny opinion or reaction if it fits naturally.
-- Also make sure to convert numbers into letters like 12 change it to twelve, 55 to fifty five, 583 to five hundred and eighty three, also if the figure is like this 12-20 make it twelve to twenty. i dont want no number figures in the output.
-- If results don't answer the question, be honest about it with a touch of humor."""
+- Skip any filler — the user already heard one.
+- Jump straight to the answer.
+- 2-3 SHORT sentences max. Keep each under 18 words.
+- Sound like you're telling a coworker, not reading a report.
+- If the results don't have the answer, just say so naturally — don't apologize."""
 
 INTERRUPT_PROMPT = """You are Sam, a witty senior PM. You were interrupted.
 Reply in ONE sentence — 15 words max. Be quick, natural.
 Start with: "Oh," / "Right," / "Sure," / "Got it," — then pivot to their question."""
 
-SEARCH_QUERY_PROMPT = """Convert the user's message into a short English Google search query (max 10 words).
-If the user says 'our company'/'my company'/'our'/'we', replace with 'AnavClouds Software Solutions'.
-Do NOT add AnavClouds if the user didn't mention the company.
+SEARCH_QUERY_PROMPT = """Convert the user's message into a DESCRIPTIVE Google search query (8-15 words).
+Make the query specific and detailed so Google returns the best results.
+Replace 'our company'/'my company'/'our'/'we' with 'AnavClouds Software Solutions'.
+If the user does NOT mention the company, do NOT add AnavClouds.
+Remove 'Sam' and filler words.
+If the message is about conversation memory (what did I ask, repeat, previous question) — output: SKIP
+For multi-part questions, include all parts in a single descriptive query.
+
+Examples:
+"What are the hourly rates?" → "What is the hourly rate and pricing of AnavClouds Software Solutions"
+"Who is the CEO?" → "Who is the CEO and founder of AnavClouds Software Solutions company"
+"Who is the prime minister of India?" → "Who is the current prime minister of India 2025"
+"What's the weather in Delhi?" → "What is the weather forecast in Delhi India today"
+"Tell me about the company" → "AnavClouds Software Solutions company overview services and products"
+"What is the density of India and who founded your company?" → "Population density of India and founder of AnavClouds Software Solutions"
+"How many employees?" → "How many employees work at AnavClouds Software Solutions team size"
+"What was my previous question?" → SKIP
+
 Output ONLY the search query. No quotes, no explanation."""
 
 FILLERS = [
@@ -220,6 +282,28 @@ FILLERS = [
     "Yeah, hold on, let me find that for you.",
     "Well, let me check on that real quick.",
 ]
+
+
+# ── End-of-Turn Classifier (RESPOND vs WAIT) ────────────────────────────────
+EOT_PROMPT = """You are Sam, an AI participant in a live meeting. Someone is speaking to you. Based on the conversation, decide:
+
+Should you RESPOND now, or WAIT for them to continue?
+
+{context_block}Current utterance: "{text}"
+
+RESPOND if ANY of these are true:
+- The utterance contains a question (even rhetorical like "Right?" or "You know?")
+- The utterance is a request or command ("Tell me...", "Can you...")
+- The utterance is a short reaction or statement directed at you
+- The speaker seems to be done talking and waiting for your input
+- You are unsure — RESPOND is always safer than making someone wait
+
+WAIT only if ALL of these are true:
+- The utterance is clearly mid-sentence (grammatically incomplete)
+- OR the speaker is obviously setting up a longer explanation and hasn't asked anything yet
+- AND there is no question, request, or floor-handoff signal
+
+Reply with one word: RESPOND or WAIT"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -270,21 +354,33 @@ class PMAgent:
         self.rag.add(speaker, text)
 
     async def _build_context(self, user_text: str, context: str) -> str:
-        """Build context using fast keyword search + recent conversation."""
+        """Build meeting context for the system prompt (NOT the user message).
+        Returns a string to append to the system prompt with relevant memory + recent convo.
+        Filters current utterance from RAG to prevent echo."""
         parts = []
 
-        # Fast keyword search (0ms) — vector embedding is too slow for realtime
-        rag_results = self.rag._keyword_search(user_text, top_k=2)
+        # Fast keyword search — exclude current utterance to prevent echo
+        rag_results = self.rag._keyword_search(user_text, top_k=2, exclude_text=user_text)
         if rag_results:
-            parts.append("Meeting memory:\n" + "\n".join(rag_results))
+            parts.append("MEETING MEMORY (relevant past exchanges):\n" + "\n".join(rag_results))
 
-        # Recent conversation — only last 2 turns to keep tokens low
+        # Recent conversation — last 4 lines for flow
         if context:
-            recent = "\n".join(context.split("\n")[-2:])
-            parts.append(f"Recent:\n{recent}")
+            recent = "\n".join(context.split("\n")[-4:])
+            parts.append(f"RECENT CONVERSATION:\n{recent}")
 
-        parts.append(f"User: {user_text}")
-        return "\n".join(parts)
+        if not parts:
+            return ""
+
+        full_context = "\n\n".join(parts)
+
+        # _debug_log("BUILD CONTEXT (system prompt appendix)",
+        #            user_text=user_text,
+        #            convo_history_raw=context or "(EMPTY)",
+        #            rag_results=rag_results or "(NONE)",
+        #            built_context=full_context)
+
+        return full_context
 
     # ── Search signal ─────────────────────────────────────────────────────────
 
@@ -298,6 +394,7 @@ class PMAgent:
         """Ultra-fast classification: [PM] or [FT]. ~100-150ms on 8b."""
         import time as _t
         t0 = _t.time()
+        # _debug_log("ROUTER", user_text=user_text)
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -317,6 +414,65 @@ class PMAgent:
             print(f"[Agent] Router failed: {e} — defaulting PM")
             return "PM"
 
+    # ── End-of-Turn Classifier ────────────────────────────────────────────────
+
+    async def check_end_of_turn(self, text: str, context: str = "") -> str:
+        """Decide if the speaker expects a response now or is still talking.
+        Returns 'RESPOND' or 'WAIT'.
+        Uses conversation context for better decisions.
+        Defaults to RESPOND on timeout/error (don't leave user hanging)."""
+        import time as _t
+        import re as _re
+        t0 = _t.time()
+        # Clean transcript artifacts
+        clean_text = _re.sub(r'\s+', ' ', text).strip()
+
+        # Build context block (last 3 exchanges)
+        context_block = ""
+        if context:
+            lines = [l for l in context.strip().split('\n') if l.strip()][-3:]
+            if lines:
+                context_block = "Recent conversation:\n" + "\n".join(lines) + "\n\n"
+
+        # _debug_log("EOT CHECK",
+        #            utterance=clean_text,
+        #            context_raw=context or "(EMPTY)",
+        #            context_block=context_block or "(EMPTY)",
+        #            full_prompt=EOT_PROMPT.format(text=clean_text, context_block=context_block))
+
+        try:
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": EOT_PROMPT.format(
+                            text=clean_text,
+                            context_block=context_block
+                        )},
+                        {"role": "user", "content": "RESPOND or WAIT?"},
+                    ],
+                    temperature=0.0,
+                    max_tokens=3,
+                ),
+                timeout=0.5,
+            )
+            result = response.choices[0].message.content.strip().upper()
+            # Parse: check for WAIT first (since RESPOND doesn't contain WAIT)
+            if "WAIT" in result:
+                decision = "WAIT"
+            else:
+                decision = "RESPOND"
+            ms = (_t.time() - t0) * 1000
+            emoji = "🟢" if decision == "RESPOND" else "🟡"
+            print(f"[EOT] {emoji} {decision} ({ms:.0f}ms): \"{clean_text[:60]}\"")
+            return decision
+        except asyncio.TimeoutError:
+            print(f"[EOT] ⏱ Timeout — defaulting RESPOND")
+            return "RESPOND"
+        except Exception as e:
+            print(f"[EOT] Error: {e} — defaulting RESPOND")
+            return "RESPOND"
+
     # ── LLM search query conversion ──────────────────────────────────────────
 
     async def _to_english_search_query(self, user_text: str, context: str) -> str:
@@ -325,6 +481,11 @@ class PMAgent:
         if context:
             recent = context.split("\n")[-3:]
             context_hint = "\nRecent conversation:\n" + "\n".join(recent)
+
+        # _debug_log("SEARCH QUERY CONVERSION",
+        #            user_text=clean,
+        #            context_hint=context_hint or "(EMPTY)",
+        #            full_system_prompt=SEARCH_QUERY_PROMPT + context_hint)
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -333,9 +494,11 @@ class PMAgent:
                     {"role": "user", "content": clean},
                 ],
                 temperature=0.0,
-                max_tokens=20,
+                max_tokens=30,
             )
             query = response.choices[0].message.content.strip().strip('"\'')
+            # Safety: only use first line (LLM sometimes outputs multiple)
+            query = query.split('\n')[0].strip()
             print(f"[Agent] LLM search query: \"{clean}\" → \"{query}\"")
             return query
         except Exception as e:
@@ -350,8 +513,13 @@ class PMAgent:
         try:
             results = await self._get_web_search().search(search_query)
             if not results:
+                # _debug_log("SEARCH SUMMARY", search_query=search_query, results="(NONE)")
                 return "Hmm, couldn't find that online right now."
             system = SEARCH_SUMMARY_PROMPT.format(search_results=results[:800])
+            # _debug_log("SEARCH SUMMARY",
+            #            search_query=search_query,
+            #            results_preview=results[:200],
+            #            user_text=user_text)
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -375,10 +543,13 @@ class PMAgent:
         return await self.respond_with_context(user_text, "")
 
     async def respond_with_context(self, user_text: str, context: str, interrupted: bool = False) -> str:
-        full_text = await self._build_context(user_text, context)
+        meeting_context = await self._build_context(user_text, context)
 
         if interrupted:
-            return await self._llm_call(full_text, INTERRUPT_PROMPT, max_tokens=25)
+            system = INTERRUPT_PROMPT
+            if meeting_context:
+                system = INTERRUPT_PROMPT + "\n\n" + meeting_context
+            return await self._llm_call(user_text, system, max_tokens=25)
 
         # Fast route: [PM] or [FT]?
         route = await self._route(user_text)
@@ -397,8 +568,11 @@ class PMAgent:
                 print(f"[Agent] Web search failed: {e}")
                 return "Hmm, I couldn't look that up right now."
 
-        # PM path — answer directly
-        return await self._llm_call(full_text, PM_PROMPT, max_tokens=60)
+        # PM path — answer directly, context in system prompt
+        system = PM_PROMPT
+        if meeting_context:
+            system = PM_PROMPT + "\n\n" + meeting_context
+        return await self._llm_call(user_text, system, max_tokens=120)
 
     # ── Core: streaming (used by websocket_server) ───────────────────────────
 
@@ -407,24 +581,37 @@ class PMAgent:
         import time as _t
 
         t0 = _t.time()
-        full_text = await self._build_context(user_text, context)
+        meeting_context = await self._build_context(user_text, context)
         rag_ms = (_t.time() - t0) * 1000
         print(f"[Agent] ⏱ RAG context: {rag_ms:.0f}ms")
 
-        self.history.append({"role": "user", "content": full_text})
-        if len(self.history) > 4:
-            self.history = self.history[-4:]
+        # Store CLEAN user text in history (not context blocks!)
+        self.history.append({"role": "user", "content": user_text})
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
 
-        total_chars = len(PM_PROMPT) + sum(len(m["content"]) for m in self.history)
+        # Build system prompt: PM personality + meeting context
+        system_prompt = PM_PROMPT
+        if meeting_context:
+            system_prompt = PM_PROMPT + "\n\n" + meeting_context
+
+        total_chars = len(system_prompt) + sum(len(m["content"]) for m in self.history)
         print(f"[Agent] ⏱ Context size: {total_chars} chars (~{total_chars//4} tokens)")
+
+        # _debug_log("PM STREAM",
+        #            user_text=user_text,
+        #            convo_history_raw=context or "(EMPTY)",
+        #            meeting_context=meeting_context or "(NONE)",
+        #            llm_history=[f"{m['role']}: {m['content'][:80]}" for m in self.history],
+        #            system_prompt_preview=system_prompt[-300:])
 
         try:
             t1 = _t.time()
             stream = await self.client.chat.completions.create(
                 model=self.model,
-                messages=[{"role": "system", "content": PM_PROMPT}] + self.history,
+                messages=[{"role": "system", "content": system_prompt}] + self.history,
                 temperature=0.7,
-                max_tokens=60,
+                max_tokens=120,
                 stream=True,
             )
             stream_open_ms = (_t.time() - t1) * 1000
@@ -454,7 +641,11 @@ class PMAgent:
                     idx = min(indices)
                     sentence = buffer[:idx+1].strip()
                     buffer = buffer[idx+1:].lstrip()
-                    if sentence:
+                    if sentence and len(sentence) > 2:  # skip punctuation-only fragments like "."
+                        # Strip emote/action markers — TTS would say "(laughs)" literally
+                        sentence = re.sub(r'\([^)]*\)', '', sentence).strip()
+                        if not sentence or len(sentence) <= 2:
+                            continue
                         sentence_count += 1
                         sent_ms = (_t.time() - t1) * 1000
                         print(f"[Agent] ⏱ Sentence {sentence_count} ready: {sent_ms:.0f}ms")
@@ -463,8 +654,10 @@ class PMAgent:
             llm_total_ms = (_t.time() - t1) * 1000
             print(f"[Agent] ⏱ LLM total: {llm_total_ms:.0f}ms ({len(full_response.split())} words)")
 
-            if buffer.strip():
-                await queue.put(buffer.strip())
+            if buffer.strip() and len(buffer.strip()) > 2:
+                clean_buf = re.sub(r'\([^)]*\)', '', buffer).strip()
+                if clean_buf and len(clean_buf) > 2:
+                    await queue.put(clean_buf)
             self.history.append({"role": "assistant", "content": full_response.strip()})
 
         except Exception as e:
@@ -476,9 +669,10 @@ class PMAgent:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     async def _llm_call(self, user_msg: str, system: str, max_tokens: int = 60) -> str:
+        """LLM call with clean history. user_msg goes as clean text, not context dump."""
         self.history.append({"role": "user", "content": user_msg})
-        if len(self.history) > 4:
-            self.history = self.history[-4:]
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
 
         stream = await self.client.chat.completions.create(
             model=self.model,
